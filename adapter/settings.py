@@ -75,6 +75,12 @@ class Settings:
     reconciler_enabled: bool = False
     reconciler_interval_seconds: float = 15.0
 
+    # --- 版本 ---
+    #: 由 CI 在**构建镜像时**注入（`--build-arg APP_VERSION=<x.y.z>` → 本 ENV）。
+    #: 它回答的是运维最常问的那句话："现在跑的是哪个镜像"，所以出现在 `/healthz`。
+    #: 本地直接跑源码时是 `dev`（不假装是个发布版本）。
+    adapter_version: str = "dev"
+
     # --- 可观测（架构 §12）---
     log_level: str = "INFO"
     logfire_token: str = ""
@@ -114,6 +120,7 @@ class Settings:
             body_limit_bytes=_num("BODY_LIMIT_BYTES", 64 * 1024 * 1024),
             reconciler_enabled=_flag("RECONCILER_ENABLED", False),
             reconciler_interval_seconds=float(_num("RECONCILER_INTERVAL_SECONDS", 15)),
+            adapter_version=_text("ADAPTER_VERSION", "dev"),
             log_level=_text("LOG_LEVEL", "INFO"),
             logfire_token=_text("LOGFIRE_TOKEN"),
             logfire_service_name=_text("LOGFIRE_SERVICE_NAME", "video-adapter"),

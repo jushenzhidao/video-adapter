@@ -4,6 +4,13 @@ uvicorn[standard]>=0.30
 httpx>=0.27
 pydantic>=2.7
 
+# --- 服务进程 ---
+# gunicorn 负责进程管理（worker 回收 / 优雅排空 / 心跳），uvicorn-worker 提供 asyncio worker。
+# ⚠️ worker_class 不要写 `uvicorn.workers.UvicornWorker`：uvicorn 0.52 起该模块已弃用
+#    （实测会打印 DeprecationWarning），官方指定改用 uvicorn-worker 包。详见 gunicorn.conf.py。
+gunicorn>=23.0
+uvicorn-worker>=0.3
+
 # --- 上报（可观测）---
 # 未配置 LOGFIRE_TOKEN 时只在本地收集，不外发；没装这个包也能起（装配失败只降级）。
 # ⚠️ 不引入 opentelemetry-instrumentation-* ：自动埋点的属性集不由我们控制，

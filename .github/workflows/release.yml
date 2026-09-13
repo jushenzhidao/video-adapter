@@ -1,0 +1,154 @@
+name: Release
+
+# 版本号由**人**决定：`git tag -a v0.1.1 -m "Release v0.1.1" && git push origin v0.1.1`。
+#
+# 为什么不采用 image-adapter 那套"push main 即自增 patch"：
+# 本项目的对外契约是**Seedance 协议投影 + 上报字段表**（见 docs/03_引擎架构.md §12），
+# 而日常 push 里混着文档、记忆与重构。自动发版会把"契约没变"和"契约变了"混成同一条
+# 时间线，调用方无法据此判断能不能升。tag 即承诺：**谁打 tag，谁对兼容性负责。**
+# （要改回自动递增：把 on.push.branches 打开，递增逻辑见下方注释保留的那段。）
+on:
+  push:
+    tags: ['v[0-9]*.[0-9]*.[0-9]*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（必须已存在，如 v0.1.0）'
+        required: true
+
+permissions:
+  contents: write    # 建 Release（tag 由人推，不由本 job 推）
+  packages: write    # 推 ghcr
+
+# 同一 tag 不并发；但**不取消**已在跑的（取消会留下"镜像推了、Release 没建"的半成品）。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 取"上一个版本 tag"要历史；浅克隆会让 changelog 范围退化。
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: ver
+        run: |
+          set -euo pipefail
+          # workflow_dispatch 走 inputs.tag；tag 触发走 ref_name。
+          TAG='${{ inputs.tag }}'
+          if [ -z "$TAG" ]; then TAG='${{ github.ref_name }}'; fi
+          case "$TAG" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::tag '$TAG' does not match v<major>.<minor>.<patch>"; exit 1 ;;
+          esac
+          echo "tag=${TAG}"                            >> "$GITHUB_OUTPUT"
+          # ⚠️ 镜像 tag **不带 v 前缀**（git tag 带、镜像不带，这不是笔误）
+          echo "version=${TAG#v}"                      >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse --short=7 HEAD)"   >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          echo "releasing ${TAG} as ${TAG#v}"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 发版前先验证：镜像推出去就可能被部署，tag 推出去就代表承诺。
+      # 四套 runner **自带**（不依赖 pytest），任一非零退出即失败 → set -e 兜住。
+      - name: Run tests
+        env:
+          # 空 token ⇒ logfire 只在进程内运行，绝不向云端发 trace（测试本身就是这么写的）
+          LOGFIRE_TOKEN: ''
+        run: |
+          set -euo pipefail
+          for t in tests/test_aivideomaker_video_v1.py tests/test_engine.py \
+                   tests/test_persistence_sqlite.py tests/test_observability.py; do
+            echo "===== ${t}"
+            python "$t"
+          done
+
+      - name: Build changelog
+        run: |
+          set -euo pipefail
+          TAG='${{ steps.ver.outputs.tag }}'
+          REPO_URL='https://github.com/${{ github.repository }}'
+          # 上一个版本 tag：`${TAG}^` 把注解 tag peel 到父提交，所以不会取到自己；
+          # 首个 release 时 describe 失败 ⇒ 列出全部可达 commit（限长，避免正文过大）。
+          if PREV="$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "${TAG}^" 2>/dev/null)"; then
+            {
+              printf '**Full changelog**: %s/compare/%s...%s\n\n' "$REPO_URL" "$PREV" "$TAG"
+              printf '## Changes since %s\n\n' "$PREV"
+              git log --no-merges --pretty='- %s (%h)' "${PREV}..${TAG}"
+            } > CHANGELOG.md
+          else
+            {
+              printf '## Initial release\n\n'
+              printf '首个版本：**任意视频生成上游 → 火山方舟 Seedance 协议**的适配层。\n\n'
+              printf '容器：`ghcr.io/%s:%s`（另带 `latest` 与 `sha-%s`）\n\n' \
+                '${{ github.repository }}' '${{ steps.ver.outputs.version }}' '${{ steps.ver.outputs.sha }}'
+              printf '## commits\n\n'
+              git log --no-merges --pretty='- %s (%h)' --max-count=50 "${TAG}"
+            } > CHANGELOG.md
+          fi
+          cat CHANGELOG.md
+
+      - name: Log in to GitHub Container Registry
+        run: |
+          set -euo pipefail
+          echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+
+      # 三个 tag 共用**同一次** build ⇒ digest 必然相同（核验时三者的
+      # docker-content-digest 必须一致，不一致说明构建了两次）。
+      - name: Build and push image
+        run: |
+          set -euo pipefail
+          IMAGE='${{ steps.ver.outputs.image }}'
+          VERSION='${{ steps.ver.outputs.version }}'
+          SHA='${{ steps.ver.outputs.sha }}'
+          docker build \
+            --build-arg APP_VERSION="$VERSION" \
+            -t "$IMAGE:$VERSION" \
+            -t "$IMAGE:latest" \
+            -t "$IMAGE:sha-$SHA" \
+            .
+          docker push "$IMAGE:$VERSION"
+          docker push "$IMAGE:latest"
+          docker push "$IMAGE:sha-$SHA"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG='${{ steps.ver.outputs.tag }}'
+          # 不用 --generate-notes：它依赖已合并的 PR，本仓库直推 main，实测只产出一行
+          # compare 链接。notes 由上面的 git log 生成。
+          gh release create "$TAG" --title "$TAG" --notes-file CHANGELOG.md
+
+      - name: Summary
+        run: |
+          {
+            echo "### 已发布 ${{ steps.ver.outputs.tag }}"
+            echo ""
+            echo "- \`${{ steps.ver.outputs.image }}:${{ steps.ver.outputs.version }}\`"
+            echo "- \`${{ steps.ver.outputs.image }}:latest\`"
+            echo "- \`${{ steps.ver.outputs.image }}:sha-${{ steps.ver.outputs.sha }}\`"
+            echo "- Release: https://github.com/${{ github.repository }}/releases/tag/${{ steps.ver.outputs.tag }}"
+            echo ""
+            echo "拉取：\`docker pull ${{ steps.ver.outputs.image }}:${{ steps.ver.outputs.version }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # 包可见性仍是**人工**一步，不自动化：GITHUB_TOKEN 管不了用户级 package，
+      # 正确路由需要 classic PAT 的 write:packages，为这点引入 PAT 不划算。
+      # 免凭据核验（200 = 匿名可拉）：
+      #   TOKEN=$(curl -s "https://ghcr.io/token?scope=repository:OWNER/NAME:pull&service=ghcr.io" \
+      #     | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+      #   curl -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $TOKEN" \
+      #     https://ghcr.io/v2/OWNER/NAME/manifests/latest

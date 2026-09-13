@@ -1,0 +1,96 @@
+# video-adapter —— 默认**单副本 + 持久卷**，高可用形态按需切换。
+#
+# 与同类项目（image-adapter 那种无状态代理）的关键差异：**本服务有状态**。
+#   ① 任务表必须活过重启 —— 契约要求 `GET /tasks/{id}` 在 7 天内可用（§6.2），
+#      所以容器重建不能把任务记录一起带走 ⇒ 必须有持久卷；
+#   ② 并发闸门 `ConcurrencyGate` 是**进程内**状态 ⇒ 副本数会影响闸门语义（见文末）。
+# 于是这里的默认形态是「1 副本 + 命名卷 + sqlite」，而不是"副本随便开"。
+#
+# 起法：
+#   cp .env.example .env      # 至少填 ADAPTER_KEY 与 TASK_KEY_FINGERPRINT_SECRET
+#   docker compose up -d
+#   curl -s localhost:8000/healthz
+
+services:
+  adapter:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/jushenzhidao/video-adapter:latest
+    restart: unless-stopped
+
+    # ⚠️ 刻意**不写 container_name**：写了就只能跑一个副本（`--scale` 会报名字冲突），
+    # 而高可用恰恰要多副本。代价是容器名由 compose 生成（`video-adapter-adapter-1`）。
+    ports:
+      # 单副本形态的便利映射；多副本时必须删掉这一行（见文末）。
+      - "${PORT:-8000}:8000"
+
+    # 配置的唯一来源。文件的每个键都按名字被 adapter/settings.py 读取，
+    # 所以新增开关不需要动这个文件。
+    env_file:
+      - .env
+
+    environment:
+      # 容器内端口（gunicorn 读 PORT）；宿主映射由上面那行决定。
+      PORT: 8000
+      # 任务表与转存产物都落到**卷**里：容器重建/滚动发布都不能丢任务。
+      TASK_STORE_PATH: /app/data/tasks.sqlite3
+      MEDIA_DIR: /app/data/media
+      # 默认 1：并发闸门是进程内状态、任务后端是 sqlite（见 gunicorn.conf.py 的长注释）。
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-1}
+
+    volumes:
+      # 命名卷而非 bind mount：容器可以调度到任何一台机器，且首次创建时会继承镜像里
+      # /app/data 的属主（adapter:1000），非 root 进程才写得进去。
+      - adapter-data:/app/data
+
+    # 加固：进程只写 /app/data（卷）与 /tmp（tmpfs），根文件系统只读。
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+
+    # 🔴 必须 **大于** gunicorn 的 graceful_timeout（120s）：compose 到期直接 SIGKILL，
+    # 那样优雅关机（在飞的上游调用 + 退出前 flush_spans()）会变成"没跑完就被砍"。
+    stop_grace_period: 150s
+
+    # 健康检查用**镜像里自带**的那条（Dockerfile 的 HEALTHCHECK，走 /healthz 且绕开代理），
+    # 不在这里重复写一份：两份定义迟早会漂移，而"哪份是真的"没人知道。
+
+  # 共享任务后端（可选，只在多副本/多 worker 时需要）。
+  #
+  # 为什么不是默认启动：单副本时 sqlite + 命名卷已经满足 7 天契约，多一个要运维的组件
+  # 没有收益。开启后才需要 `TASK_STORE=redis` + `TASK_STORE_URL=redis://redis:6379/0`。
+  #
+  # ⚠️ 刻意不写 depends_on：连不上 redis 时本服务会**明确报错退出**，而不是静默退化成
+  #    进程内存储（那会让重启后的 GET 变成 404，而调用方以为任务还在跑 —— 直接违约）。
+  #    启动顺序交给编排层重试，不由 compose 的隐式顺序保证。
+  redis:
+    image: redis:7-alpine
+    profiles: ["shared-store"]
+    restart: unless-stopped
+    # appendonly：任务表是**契约数据**，不能只放内存。
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1000"]
+    volumes:
+      - redis-data:/data
+    # 不发布端口：只给本 compose 网络内的 adapter 用。
+
+volumes:
+  adapter-data:
+  redis-data:
+
+# ---------------------------------------------------------------------------
+# 高可用（多副本）形态：三处一起改，缺一不可
+#
+#   1) 删掉 adapter 的 `ports:` —— 固定宿主端口无法被多个副本共享；
+#      入口交给前置代理（nginx / traefik / 云 LB）或 docker compose 之外的编排层。
+#   2) 打开共享存储：.env 里 `TASK_STORE=redis`、`TASK_STORE_URL=redis://redis:6379/0`，
+#      并让 redis 参加：
+#         docker compose --profile shared-store up -d --scale adapter=3
+#   3) 确认 `WEB_CONCURRENCY` 不要跟着一起放大 —— 见下面的语义提醒。
+#
+# ⚠️ **语义提醒（不可绕过）**：并发闸门的槽位是**进程内**计数，从任务创建占到终态。
+#    `副本数 × WEB_CONCURRENCY` 等于同一渠道的实际并发上限被放大这么多倍。
+#    也就是说：横向扩容换的是吞吐与可用性，**代价是闸门不再精确**。
+#    若闸门必须精确（例如上游按并发限流会直接拒绝），请让渠道侧
+#    `X-Channel-Options.max_concurrency` 按"单进程上限"配置，或保持单进程。
+# ---------------------------------------------------------------------------

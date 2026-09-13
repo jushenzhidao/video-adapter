@@ -193,6 +193,8 @@ def build_router(settings: Settings) -> APIRouter:
         observation = getattr(state, "observability", None) or observability.observation_state()
         body = {
             "status": "ok",
+            # 镜像版本（CI 构建时注入）：值班第一句话是"跑的是哪个版本"
+            "version": settings.adapter_version,
             "task_store": getattr(store, "backend", None),
             "queue": gate.stats() if gate is not None else None,
             "credential_fingerprint": settings.fingerprint_algorithm,

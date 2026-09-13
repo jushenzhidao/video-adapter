@@ -83,7 +83,10 @@ DELETE /api/v3/contents/generations/tasks/{id}   → 取消（仅 queued 可取�
       凭证在源头打码；字段表见 [`docs/03_引擎架构.md`](docs/03_引擎架构.md) §12，
       决策见 [`ADR-006`](docs/decisions/ADR-006-report-fidelity.md)
 - [x] 四套测试共 **117 项**全绿，零消耗（见下）
-- [ ] Dockerfile、接入示例
+- [x] **容器化与发版**：`Dockerfile`（非 root / 只读根 / 自带健康检查）＋ `gunicorn.conf.py`
+      （高可用调参，理由写在文件里）＋ `docker-compose.yml`（默认单副本 + 持久卷；多副本形态见文末）
+      ＋ `.github/workflows/release.yml`（**推 tag 即发布**：构建并推 GHCR 三个 tag + 建 Release）
+- [ ] 接入示例（`curl` / SDK 片段）
 
 ## 怎么跑
 
@@ -100,11 +103,25 @@ python tests/test_observability.py            # 17 项 上报内容（离线；l
 # 上报通路（线上，**会真外发**一条合成 span，需 LOGFIRE_TOKEN）
 LOGFIRE_TOKEN="$(cat /tmp/.logfire_token)" python scripts/logfire_online_probe.py
 
-# 起服务
+# 起服务（本地直跑：gunicorn，配置即生产那份）
 cp .env.example .env    # 至少填 ADAPTER_KEY 与 TASK_KEY_FINGERPRINT_SECRET
-.venv/bin/uvicorn adapter.main:app --host 127.0.0.1 --port 8000
+.venv/bin/gunicorn adapter.main:app --config gunicorn.conf.py
 # 契约表与试调：http://127.0.0.1:8000/docs
+
+# 起服务（容器，推荐：带持久卷与健康检查）
+docker compose up -d --build
+curl -s localhost:8000/healthz      # 里面能看到 version / logfire / queue 三块状态
 ```
+
+**发版**（打 tag 即发布，工作流会跑测试 → 推镜像 → 建 Release）：
+
+```bash
+git tag -a v0.1.1 -m "Release v0.1.1" && git push origin v0.1.1
+docker pull ghcr.io/jushenzhidao/video-adapter:0.1.1   # 镜像 tag 不带 v 前缀
+```
+
+扩容/高可用的三处改动、以及"并发闸门是进程内状态"这条语义代价，见
+[`docs/03_引擎架构.md`](docs/03_引擎架构.md) §16 与 `docker-compose.yml` 文末。
 
 接入方按渠道配置请求头即可（一个渠道一套）：`X-Upstream-Url` / `X-Script-Ref` /
 `X-Auth-Emit` / `X-Channel-Options`，凭证放 `Authorization`。

@@ -70,7 +70,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(
         title="video-adapter",
-        version="0.1.0",
+        # 版本号的唯一来源是设置（镜像里由 APP_VERSION 注入）——写死字面量会让
+        # /docs 上的版本与镜像 tag 各说各话（image-adapter 上真踩过）。
+        version=settings.adapter_version,
         description=(
             "把任意视频生成上游适配为**火山方舟 Seedance** 原生异步任务协议。\n\n"
             "调用方只改 `Base URL` 与 `API Key`；多上游靠 `model = provider/model` 区分。"

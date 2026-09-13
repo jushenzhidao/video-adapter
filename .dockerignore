@@ -1,0 +1,36 @@
+# 构建上下文瘦身 + 防泄漏。Dockerfile 只 COPY 运行期需要的目录，
+# 这里再挡一道：把**永远不该进镜像**的东西排除掉。
+.git
+.github
+.workbuddy
+.venv
+venv
+
+# 环境与凭据
+.env
+.env.*
+!.env.example
+
+# 运行产物
+.tasks.sqlite3
+.tasks.sqlite3-wal
+.tasks.sqlite3-shm
+.media/
+*.log
+
+# 非运行期内容
+tests
+scripts
+docs
+README.md
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# 字节码与缓存
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.ruff_cache
+.mypy_cache
