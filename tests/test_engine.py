@@ -185,19 +185,25 @@ class Client:
 
 
 def make_settings(upstream: FakeUpstream, **overrides) -> Settings:
-    base = Settings.from_env(
-        adapter_key=ADAPTER_KEY,
-        upstream_allow_private_network=True,
-        upstream_trust_env=False,
-        task_store="memory",
-        task_store_path="/tmp/video-adapter-test.sqlite3",
-        script_store_dir=SCRIPT_STORE,
-        task_key_fingerprint_secret="test-secret",
-        default_max_concurrency=2,
-        queue_wait_seconds=0.3,
-        upstream_retry_attempts=1,
-    )
-    return base
+    values = {
+        "adapter_key": ADAPTER_KEY,
+        "upstream_allow_private_network": True,
+        "upstream_trust_env": False,
+        "task_store": "memory",
+        "task_store_path": "/tmp/video-adapter-test.sqlite3",
+        "script_store_dir": SCRIPT_STORE,
+        "task_key_fingerprint_secret": "test-secret",
+        "default_max_concurrency": 2,
+        "queue_wait_seconds": 0.3,
+        "upstream_retry_attempts": 1,
+        # ⚠️ 本文件测的是**链路语义**（创建 → 查询 → 终态、闸门、转存），不是降频。
+        #    查询缓存（生产默认 2s）会把"连着查两次"合并成一次上游调用，从而改变
+        #    "第二次查询才到终态"这类断言的节奏 —— 所以这里显式关掉它。
+        #    降频行为由 tests/test_rate_limit.py 在**真实的默认配置**下单独验证。
+        "query_cache_seconds": 0.0,
+    }
+    values.update(overrides)
+    return Settings.from_env(**values)
 
 
 class Harness:

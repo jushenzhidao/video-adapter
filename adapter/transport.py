@@ -139,11 +139,18 @@ class UpstreamClient:
                 origin, wait_seconds=self._settings.rate_limit_wait_seconds
             )
             if not decision.granted:
-                detail = (
-                    "a 429 cooldown is active for this upstream"
-                    if decision.reason == "cooldown"
-                    else f"no token within the {self._settings.rate_limit_wait_seconds:.0f}s wait budget"
-                )
+                if decision.reason == "cooldown":
+                    detail = "a 429 cooldown is active for this upstream"
+                elif decision.reason == "fail_closed":
+                    detail = (
+                        "the shared rate-limit backend is unreachable and "
+                        "RATE_LIMIT_FAIL_MODE=closed"
+                    )
+                else:
+                    detail = (
+                        f"no token within the {self._settings.rate_limit_wait_seconds:.0f}s "
+                        "wait budget"
+                    )
                 log.warning(
                     "rate limiter blocked a query to %s (%s, retry after %ss) — upstream not called",
                     origin,
@@ -221,7 +228,7 @@ class UpstreamClient:
                         "upstream 429 from %s carried no usable Retry-After; assuming 1s", origin
                     )
                 if self._limiter is not None:
-                    applied, truncated = self._limiter.note_rate_limited(
+                    applied, truncated = await self._limiter.note_rate_limited(
                         origin, result.retry_after if result.retry_after is not None else 1.0
                     )
                     log.warning(

@@ -48,6 +48,10 @@ def _settings(db_path: str) -> Settings:
         script_store_dir=str(ROOT / "script_store"),
         task_key_fingerprint_secret="persistence-secret",
         upstream_retry_attempts=1,
+        # ⚠️ 本用例测的是**跨重启的持久化**，不是降频。查询缓存（默认 2s）会把
+        #    "连着查两次把任务推到终态"合并成一次上游调用，从而改变这里的断言节奏。
+        #    同 `test_engine.make_settings`；降频由 tests/test_rate_limit.py 专门验证。
+        query_cache_seconds=0.0,
     )
 
 

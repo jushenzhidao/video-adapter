@@ -6,7 +6,7 @@
 >
 > 三类 slug：`waiting-on-external-condition` / `design-decision-to-evaluate` / `existing-design-boundary`
 
-**汇总：3 已决 · 8 未决**
+**汇总：4 已决 · 8 未决**
 
 | Date | Source | Open Item | Related Constraints | Current Leaning | Blocked By | Resolves When | Status |
 |------|--------|-----------|---------------------|-----------------|------------|---------------|--------|
@@ -21,3 +21,4 @@
 | 2026-09-13 | §6.5 | **协调器是否启用** | 它没有调用方请求可借钥匙 ⇒ 无法自己回查上游；只能做本地可判定的事（超时置 `expired`） | 默认关闭；回调推送改为"调用方查询观察到状态变更时机会式推送"（已实现） | 需要"渠道在运行期注册凭证"的机制 | 决定是否投入做凭证注册 | OPEN · `design-decision-to-evaluate` |
 | 2026-09-13 | §8.2 | **是否需要素材转存（`media.py`）** | aivideomaker 产物是**公开 24h URL**，与 Seedance 原生语义一致 | 倾向不实现（透传即可）；仅当接入"产物需鉴权/有效期 <24h"的上游时再补 | 第二个上游的实际产物语义 | 接入需要转存的上游时 | **RESOLVED**（2026-09-13：落成**逐渠道开关** `X-Channel-Options.rehost`，**默认关**）。Resolution：默认仍是"透传"（与"公开 24h URL"这一事实一致），需要时按渠道开启即可，不必等第二个上游 —— 条件变成**配置**而不是代码。开了之后：`GET /files/{name}` 给自有地址、对象名 `sha256(URL)[:24]` 使重复转存幂等、**转存失败只降级**（任务结果不变，`warnings` 里如实说明）、`rehost.upstream_url` 保留原地址。见 `adapter/media.py` 与 `tests/test_engine.py` 的转存用例 |
 | 2026-09-13 | §12 | **可观测（span / Logfire）接线优先级** | 未配置时必须静默降级为 no-op；`/healthz` 要分两个字段报"已配置"与"真的会外发" | 倾向在 P8 一并做（有 logfire token 才生效） | 用户对可观测的需求强度 | 用户确认是否现在做 | **RESOLVED**（2026-09-13 用户确认：**现在做**，且上报信息要更详细 —— 含上游 task id、request/response **原文不脱敏**（凭证除外），并要求**线上线下一起校验**）。Resolution：见 `ADR-006`；`/healthz` 再补 `ready`/`reason` 两个字段；验收 = 离线 17 项（`tests/test_observability.py`，零网络）＋ 线上探针（`scripts/logfire_online_probe.py`，需 token）|
+| 2026-09-13 | 上游文档 §6 | **限流桶是否要做成多进程共享（Redis）** | 上游按 **IP** 限 60/min，而桶是**进程内**状态 ⇒ 多 worker / 多副本下实际配额 ≈ 进程数 × 配置值 | 已实现 `RATE_LIMIT_STORE=redis`（Lua + **Redis 服务器时钟**）+ 后端不可用时的降级层 | — | — | **RESOLVED**（2026-09-13 用户指令：**「共享 Redis 桶 抓紧实现」**，并明确「无需兼容旧版本」⇒ 允许直接重构 `RateLimiter` 内部结构）。Resolution：`adapter/ratelimit.py` 拆成 `BucketStore` 协议 + `ProcessBuckets` + `RedisBuckets`（两个 Lua：取令牌 / 设冷却，**时基取 Redis 服务器时间** —— 多副本本地时钟漂移会让各副本算出**不同**配额）。配套决定：① **未配置时跟随 `TASK_STORE`**（多副本本来就要把任务表放共享存储，少一个旋钮、少一处"任务表共享了、桶忘了共享"的错配）；② `fail_mode` 默认 `open`（后端不可用 ⇒ 退回进程内桶**仍然限速** + 连续 3 次失败短路 5s + `/healthz` 报 `degraded` 且 **`scope` 如实退回 `process`**），可切 `closed` 变成硬依赖；③ `/healthz` 增报 `backend.{name,endpoint,ok,degraded}`（endpoint 已剥凭证）。原"静态分摊"降级为该模式下的替代方案（§7.1）。验收：`tests/test_rate_limit.py` 18 项（其中 6 项需真 Redis，含**两个独立实例共用一个配额**及其**反证**——process 后端下两实例各有一份，否则该断言对任何实现都成立）+ CI 加 `redis:7-alpine` service；连不上时那些用例**记 FAIL 不跳过**（静默跳过 = 虚假绿灯）。见 `ADR-008` |

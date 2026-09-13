@@ -40,6 +40,18 @@ jobs:
     # 逃生阀 + 自我触发兜底。workflow_dispatch 没有 head_commit，用 || '' 兜底。
     if: ${{ github.actor != 'github-actions[bot]' && !contains(github.event.head_commit.message || '', '[skip release]') }}
     runs-on: ubuntu-latest
+    # Redis 是**限流共享桶**与多副本任务表的后端。`tests/test_rate_limit.py` 里的 Redis 用例
+    # 在连不上时**记为 FAIL 而不是跳过**（静默跳过等于虚假绿灯）⇒ 这里必须真的提供一个实例。
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v7
         with:
@@ -109,16 +121,19 @@ jobs:
         run: pip install -r requirements.txt
 
       # 发版前先验证：镜像推出去就可能被部署，tag 推出去就代表承诺。
-      # 四套 runner **自带**（不依赖 pytest），任一非零退出即失败 → set -e 兜住。
+      # 五套 runner **自带**（不依赖 pytest），任一非零退出即失败 → set -e 兜住。
       # 最后一条把 README 的「接入示例」也当门禁跑：文档会腐烂，但没人会因为文档过期收到告警。
       - name: Run tests
         env:
           # 空 token ⇒ logfire 只在进程内运行，绝不向云端发 trace（测试本身就是这么写的）
           LOGFIRE_TOKEN: ''
+          # 限流共享桶的用例指向上面那个 service（测试里的默认值就是它，写出来是为了显式）
+          RATE_LIMIT_TEST_REDIS_URL: redis://127.0.0.1:6379/15
         run: |
           set -euo pipefail
           for t in tests/test_aivideomaker_video_v1.py tests/test_engine.py \
                    tests/test_persistence_sqlite.py tests/test_observability.py \
+                   tests/test_rate_limit.py \
                    scripts/verify_docs_examples.py; do
             echo "===== ${t}"
             python "$t"

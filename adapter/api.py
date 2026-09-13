@@ -190,13 +190,21 @@ def build_router(settings: Settings) -> APIRouter:
         state = request.app.state
         store = getattr(state, "store", None)
         gate = getattr(state, "gate", None)
+        limiter = getattr(state, "ratelimit", None)
         observation = getattr(state, "observability", None) or observability.observation_state()
+        # 限流器状态。⚠️ 先看 `scope`：`shared`（redis 桶，跨进程共享）还是 `process`
+        # （进程内桶 ⇒ 多 worker / 多副本时实际配额会按进程数放大）。
+        # `backend.degraded=true` 表示主后端不可用、当前走的是降级层（`scope` 也会如实退回 process）。
+        rate_limit_state = (
+            await limiter.snapshot() if limiter is not None else {"enabled": False}
+        )
         body = {
             "status": "ok",
             # 镜像版本（CI 构建时注入）：值班第一句话是"跑的是哪个版本"
             "version": settings.adapter_version,
             "task_store": getattr(store, "backend", None),
             "queue": gate.stats() if gate is not None else None,
+            "rate_limit": rate_limit_state,
             "credential_fingerprint": settings.fingerprint_algorithm,
             # 「已配置」与「真的会外发」必须分成两个字段：合成一个会让运维误判。
             # `ready`/`reason` 是第三件事：装配**成没成**、以及为什么不成（不静默）。
@@ -241,4 +249,11 @@ def _request_id(request: Request) -> str:
 
 async def adapter_error_handler(request: Request, exc: AdapterError):
     log.warning("%s %s → %s %s", request.method, request.url.path, exc.status, exc.code)
-    return JSONResponse(status_code=exc.status, content=exc.envelope())
+    response = JSONResponse(status_code=exc.status, content=exc.envelope())
+    retry_after = exc.retry_after_header
+    if retry_after:
+        # 429 **必须**告诉调用方该等多久。上游用 `Retry-After` 表达同一件事
+        # （`upstreams/aivideomaker-official-api.md` §6），我们把上游给的值、或本地桶
+        # 算出的值透出去。不透出去，调用方只能自己猜间隔 —— 猜小了会持续撞线。
+        response.headers["Retry-After"] = retry_after
+    return response

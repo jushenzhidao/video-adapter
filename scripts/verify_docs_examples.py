@@ -82,7 +82,8 @@ def main() -> int:
     from adapter.main import create_app
     from adapter.settings import Settings
 
-    app = create_app(Settings.from_env())
+    settings = Settings.from_env()
+    app = create_app(settings)
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         adapter_port = probe.getsockname()[1]
@@ -131,6 +132,11 @@ def main() -> int:
             print("\n[2] 查询（同一把 Key）→ 六态；终态带产物地址")
             r1 = client.get(f"{TASKS}/{task_id}", headers=headers)
             check(r1.status_code == 200 and r1.json()["status"] == "running", "首次查询 → running")
+            # ⚠️ 第二次查询必须**跨过查询缓存窗口**再发（`QUERY_CACHE_SECONDS`，默认 2s）。
+            #    窗口内的重复查询会被刻意回放同一份快照 —— 那是降频机制（§7.1）在正常工作，
+            #    不是缺陷。对调用方的含义：**轮询间隔应 ≥ QUERY_CACHE_SECONDS**。
+            #    这里从 settings 取窗口值而不是写死 2.0，避免与默认值漂移。
+            time.sleep(settings.query_cache_seconds + 0.2)
             r2 = client.get(f"{TASKS}/{task_id}", headers=headers)
             done = r2.json()
             check(done["status"] == "succeeded", "二次查询 → succeeded")

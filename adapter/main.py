@@ -19,6 +19,7 @@ from . import observability
 from .api import adapter_error_handler, build_router
 from .errors import AdapterError
 from .queue import ConcurrencyGate
+from .ratelimit import build_rate_limiter
 from .settings import Settings
 from .taskstore import build_store
 from .tasks import TaskService
@@ -37,7 +38,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         store = build_store(settings)          # 缺 Redis ⇒ 这里抛错，不静默降级
-        client = UpstreamClient(settings)
+        # 限流装配（§7.1）：上游按 IP 限 60 次/分钟，本层在**发出去之前**排队或让路。
+        # 关闭时返回 None（传输层整段跳过），并在启动日志里说明"只剩被动退避"。
+        limiter = build_rate_limiter(settings)
+        if limiter is not None:
+            # 探测共享后端（redis）。**失败只降级、不致命**（除非 fail_mode=closed）：
+            # 退回进程内桶 + 告警 + `/healthz` 标记 degraded（见 ratelimit.py 模块 docstring）。
+            await limiter.start()
+        client = UpstreamClient(settings, limiter)
         await client.start()
         # 上报装配：**失败只降级**。没有 logfire / 没有 token / 拒绝宽头抓取，
         # 都只让「真的会外发」为 false，span 仍然构建并落到日志与本地 sink。
@@ -45,6 +53,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.settings = settings
         app.state.store = store
         app.state.gate = ConcurrencyGate()
+        # 给 /healthz 看：桶的状态与 scope 必须可查，否则"配了但没生效"无从判断。
+        app.state.ratelimit = limiter
         app.state.service = TaskService(
             settings=settings, store=store, gate=app.state.gate, client=client
         )
@@ -64,6 +74,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 with contextlib.suppress(asyncio.CancelledError):
                     await reconciler
             await client.aclose()
+            if limiter is not None:
+                await limiter.close()
             await store.close()
             # 🔴 放在各资源 close **之后**：close 自己也会产生 span。
             # 批量导出挂在 daemon 线程上且不注册 atexit ⇒ 不 flush 就丢掉最后一批。

@@ -62,6 +62,20 @@ class AdapterError(Exception):
             body["param"] = self.param
         return {"error": body}
 
+    @property
+    def retry_after_header(self) -> str | None:
+        """`Retry-After` 头的值（秒）。`None` = 不该加这个头。
+
+        **向上取整**：HTTP 的 `Retry-After` 是秒粒度，宁可让调用方多等一点，
+        也不要让它提前回来撞线（提前回来只会再吃一个 429，白白消耗配额）。
+        """
+        if self.retry_after is None:
+            return None
+        whole = int(self.retry_after)
+        if float(self.retry_after) > whole:
+            whole += 1
+        return str(max(1, whole))
+
     def __str__(self) -> str:  # pragma: no cover - 便于日志
         return f"{self.code}({self.status}): {self.message}"
 
