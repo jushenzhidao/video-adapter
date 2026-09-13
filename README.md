@@ -82,11 +82,13 @@ DELETE /api/v3/contents/generations/tasks/{id}   → 取消（仅 queued 可取�
 - [x] **可观测（span / Logfire）接线**：每次上游调用带 **request/response 原文 + 上游 task id**，
       凭证在源头打码；字段表见 [`docs/03_引擎架构.md`](docs/03_引擎架构.md) §12，
       决策见 [`ADR-006`](docs/decisions/ADR-006-report-fidelity.md)
-- [x] 四套测试共 **117 项**全绿，零消耗（见下）
+- [x] 四套测试共 **118 项**全绿，零消耗（见下）
 - [x] **容器化与发版**：`Dockerfile`（非 root / 只读根 / 自带健康检查）＋ `gunicorn.conf.py`
       （高可用调参，理由写在文件里）＋ `docker-compose.yml`（默认单副本 + 持久卷；多副本形态见文末）
-      ＋ `.github/workflows/release.yml`（**推 tag 即发布**：构建并推 GHCR 三个 tag + 建 Release）
-- [ ] 接入示例（`curl` / SDK 片段）
+      ＋ `.github/workflows/release.yml`（**push main 即自增 patch**，人工 tag 留给不兼容变更，
+      见 [`ADR-007`](docs/decisions/ADR-007-release-model.md)）
+- [x] **接入示例**（本文件「5 分钟接通」＋ `scripts/verify_docs_examples.py`：22 项断言把那一节
+      的状态码与字段名钉住，零成本可重跑）
 
 ## 怎么跑
 
@@ -99,6 +101,10 @@ python tests/test_aivideomaker_video_v1.py    # 68 项 翻译层
 python tests/test_engine.py                   # 31 项 引擎端到端（本地假上游）
 python tests/test_persistence_sqlite.py       #  1 项 重启后仍能 GET
 python tests/test_observability.py            # 17 项 上报内容（离线；logfire 不在场会红）
+
+# 文档门禁：把 README「接入示例」那一节当断言跑（零成本、只打本地假上游）
+# 发版工作流也会跑它 —— 文档会腐烂，但没人会因为文档过期收到告警。
+python scripts/verify_docs_examples.py        # 22 项 示例的状态码与字段名
 
 # 上报通路（线上，**会真外发**一条合成 span，需 LOGFIRE_TOKEN）
 LOGFIRE_TOKEN="$(cat /tmp/.logfire_token)" python scripts/logfire_online_probe.py
@@ -147,3 +153,116 @@ docker pull ghcr.io/jushenzhidao/video-adapter:latest   # 镜像 tag 不带 v �
 | `max_credits` | 上限是**提交前置条件**：上游没有计费前闸门，拿不到上限就 400 |
 | `credit_table` | 给**动态计价模型**（`seedance20`）补每秒费率，让它恢复可估 |
 | `allow_unpriced` | 显式接受"成本不可在提交前验证"；不给且算不出成本 → 400 |
+
+## 接入示例（5 分钟接通）
+
+> ⚠️ 这一节的每条都**可执行验证**：`python scripts/verify_docs_examples.py` 会把下面每个
+> 状态码与字段名在本地假上游上重跑一遍（**22 项断言，零成本**、不碰真实上游）。
+> 文档会腐烂，而没人会因为文档过期收到告警 —— 所以把它变成断言。
+
+四个端点与火山原生一致，**只改 Base URL 与 Key**。四类请求都要带**同一套渠道头**：
+
+| 头 | 示例 | 说明 |
+| --- | --- | --- |
+| `X-Adapter-Key` | `ak_…` | 本服务准入密钥（部署侧 `ADAPTER_KEY`；未配置则**拒绝所有**请求） |
+| `X-Upstream-Url` | `https://upstream.example.com` | 上游源站。脚本只能改**路径**、不能改 host（换 origin 直接 `channel_config_error`） |
+| `X-Script-Ref` | `aivideomaker/video@v1` | 翻译脚本引用；**内联脚本被拒绝**（ADR-005） |
+| `X-Auth-Emit` | `header:key:` | 凭证发射位置，形态 `header:<名字>:<前缀>` |
+| `X-Channel-Options` | 见下 | JSON：`provider` / `max_credits` / `max_concurrency` / `rehost` / `credit_table` |
+| `Authorization` | `Bearer <上游 Key>` | 上游凭证。**不落明文**，只存 HMAC 指纹（ADR-003） |
+
+```bash
+BASE=http://127.0.0.1:8000
+CH=(-H "X-Adapter-Key: $ADAPTER_KEY" \
+    -H "X-Upstream-Url: $UPSTREAM_URL" \
+    -H "X-Script-Ref: aivideomaker/video@v1" \
+    -H "X-Auth-Emit: header:key:" \
+    -H 'X-Channel-Options: {"provider":"aivideomaker","max_credits":5000,"allow_unpriced":true}' \
+    -H "Authorization: Bearer $UPSTREAM_KEY" \
+    -H 'Content-Type: application/json')
+BODY='{"model":"aivideomaker/seedance20","content":[{"type":"text","text":"一只猫在打哈欠"}],"duration":5,"resolution":"720p","ratio":"16:9"}'
+```
+
+### 0) 先 dry-run：跑完整翻译 + 计费校验，**不发上游请求、零消耗**
+
+```bash
+curl -sS -X POST "$BASE/api/v3/contents/generations/tasks" "${CH[@]}" -H 'X-Dry-Run: 1' -d "$BODY"
+```
+
+```json
+{"dry_run": true,
+ "upstream": {"method": "POST", "url": "…/api/v1/generate/seedance20",
+              "body": {"duration": 5, "resolution": 720, "ratio": "16:9", "prompt": "一只猫在打哈欠"}},
+ "provider": "aivideomaker", "model": "seedance20", "script_ref": "aivideomaker/video@v1",
+ "warnings": ["cost is not verifiable before submit …"], "unsupported": []}
+```
+
+（节选）`upstream.body` 就是脚本**将要发出的原文** —— 接一个新上游时先用它对齐字段。
+
+### 1) 创建 → 只回 `id`（外加"上报块"）
+
+```bash
+curl -sS -X POST "$BASE/api/v3/contents/generations/tasks" "${CH[@]}" -d "$BODY"
+```
+
+```json
+{"id": "cgt-20260913223613-z0u4nx",
+ "provider": "aivideomaker", "upstream_task_id": "ck001",
+ "script_ref": "aivideomaker/video@v1", "script_sha256": "f3fb92d5…",
+ "upstream_report": {"request": {"method": "POST", "url": "…", "body": {…},
+                                 "headers": {"Content-Type": "application/json"}},
+                     "response": {"status": 200, "body": {"status": "SUBMITTED", "taskId": "ck001"}, "headers": {…}},
+                     "query_count": 0}}
+```
+
+⚠️ **创建响应里没有 `status`**（契约如此）：只能轮询或走回调。
+`upstream_task_id` 与 `upstream_report` 是排障资产：回答"这次发了什么、上游回了什么、对应上游哪个任务"。
+
+### 2) 查询（**必须带同一把 Key**）
+
+```bash
+curl -sS "$BASE/api/v3/contents/generations/tasks/$ID" "${CH[@]}"
+```
+
+```json
+{"id": "cgt-…", "model": "aivideomaker/seedance20", "status": "running",
+ "content": {"video_url": null, "last_frame_url": null, "file_url": null},
+ "usage": {"completion_tokens": 15, "credits": 15, "credits_charged": 15, "credits_refunded": 0},
+ "upstream": {"status": "PROGRESS", "creditsCharged": 15, …}}
+```
+
+终态（`succeeded`）时 `content.video_url` 有值；`usage.credits` 是**上游原始积分**（对账用，
+换算口径见 §9）。已终态的任务再查**不会**打上游 —— 直接返回本地记录（7 天窗口内可用）。
+
+### 3) 列表
+
+```bash
+curl -sS "$BASE/api/v3/contents/generations/tasks?page_num=1&page_size=5" "${CH[@]}"
+# → {"items": [ … ], "total": 1, "page_num": 1, "page_size": 5}
+```
+
+列表按 `(provider, 凭证指纹)` 过滤：**只看得到本 Key 建的任务**（上游侧也是这个语义）。
+
+### 4) 取消 / 删除
+
+```bash
+curl -sS -X DELETE "$BASE/api/v3/contents/generations/tasks/$ID" "${CH[@]}"
+```
+
+`queued` → 取消（返回 `status: cancelled`）；已终态 → 删除本地记录（`{"id": …, "deleted": true}`）。
+`running` 的任务**拒绝取消**（上游只允许取消未开始的）—— 这一点与原生契约一致。
+
+### 错误码速查（`scripts/verify_docs_examples.py` 逐条断言）
+
+| 场景 | HTTP | `error.code` |
+| --- | --- | --- |
+| 拿不到支出上限 | 400 | `InvalidParameter`（`param=extra_body.aivideomaker_max_credits`） |
+| `model` 的 provider 与渠道声明不一致 | 400 | `InvalidParameter`（`param=model`） |
+| 未知任务 / 不属于本凭证 | 404 | `InvalidEndpoint.NotFound`（**刻意同码**：不泄露"它存在但归别人"） |
+| 准入密钥错 / 未配置 | 401 | `AuthenticationError` |
+| 本地并发闸门满 | 429 | `ServerOverloaded` |
+| **上游不可达（连不上 / 超时 / 连接中断）** | 502 | `UpstreamUnavailable` |
+| 上游 5xx | 502 | `InternalServiceError` |
+| 未预期异常（兜底） | 500 | `InternalServiceError`（**信封不变形**，绝不给裸 500） |
+
+信封恒为 `{"error": {"code", "message", "type", "param"?}}`（§10.1）——调用方按 `code` 分支即可。

@@ -68,6 +68,27 @@ class Settings:
     request_timeout_seconds: float = 60.0
     upstream_retry_attempts: int = 3
 
+    # --- 上游限流与查询降频（架构 §7.2）---
+    #   上游对**查询接口**按 **IP** 限 60 次/分钟 ⇒ 配额属于**出口身份**，而且是**共享**的
+    #   （同一出口 IP 上还有别的消费者）。所以默认**只声明一半**，不去贴着 60 跑；
+    #   桶键是上游 origin（不是 provider / 不是 Key）—— 理由见 ratelimit.py 的 docstring。
+    #   ⚠️ 桶是进程内状态：多 worker / 多副本时把 rpm 按进程数整除（§7.2）。
+    rate_limit_enabled: bool = True
+    #: 查询车道每分钟上限。**故意低于上游的 60** —— 吃满等于把余量留成 0。
+    rate_limit_query_rpm: int = 30
+    #: 突发额度。刻意取小：上游的窗口实现未知（固定窗口在边界会放行双倍），
+    #: 一次放出 60 个请求是"必然踩线"的写法。
+    rate_limit_query_burst: int = 5
+    #: 无令牌时最多排队等这么久（秒），超出即按契约回 429 + `Retry-After`。
+    rate_limit_wait_seconds: float = 3.0
+    #: 429 冷却封顶（秒）。上游若给一个巨大的 `Retry-After`，截断它并**告警**。
+    rate_limit_cooldown_max_seconds: float = 120.0
+    #: 429 之后允许原地重试的等待上限（秒）。超过它就不占着连接干等 —— 交给调用方退避。
+    rate_limit_retry_budget_seconds: float = 1.0
+    #: 同一任务的查询结果缓存窗口（秒）。这是**降频**的主力：调用方轮询比这更密时
+    #: 直接回放上一次结果，一次上游请求都不发。
+    query_cache_seconds: float = 2.0
+
     # --- 请求体 ---
     body_limit_bytes: int = 64 * 1024 * 1024   # 与 Seedance 契约一致
 
@@ -117,6 +138,13 @@ class Settings:
             queue_wait_seconds=float(_num("QUEUE_WAIT_SECONDS", 20)),
             request_timeout_seconds=float(_num("REQUEST_TIMEOUT_SECONDS", 60)),
             upstream_retry_attempts=_num("UPSTREAM_RETRY_ATTEMPTS", 3),
+            rate_limit_enabled=_flag("RATE_LIMIT_ENABLED", True),
+            rate_limit_query_rpm=_num("RATE_LIMIT_QUERY_RPM", 30),
+            rate_limit_query_burst=_num("RATE_LIMIT_QUERY_BURST", 5),
+            rate_limit_wait_seconds=float(_num("RATE_LIMIT_WAIT_SECONDS", 3)),
+            rate_limit_cooldown_max_seconds=float(_num("RATE_LIMIT_COOLDOWN_MAX_SECONDS", 120)),
+            rate_limit_retry_budget_seconds=float(_num("RATE_LIMIT_RETRY_BUDGET_SECONDS", 1)),
+            query_cache_seconds=float(_num("QUERY_CACHE_SECONDS", 2)),
             body_limit_bytes=_num("BODY_LIMIT_BYTES", 64 * 1024 * 1024),
             reconciler_enabled=_flag("RECONCILER_ENABLED", False),
             reconciler_interval_seconds=float(_num("RECONCILER_INTERVAL_SECONDS", 15)),

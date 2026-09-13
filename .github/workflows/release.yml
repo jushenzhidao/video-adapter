@@ -110,6 +110,7 @@ jobs:
 
       # 发版前先验证：镜像推出去就可能被部署，tag 推出去就代表承诺。
       # 四套 runner **自带**（不依赖 pytest），任一非零退出即失败 → set -e 兜住。
+      # 最后一条把 README 的「接入示例」也当门禁跑：文档会腐烂，但没人会因为文档过期收到告警。
       - name: Run tests
         env:
           # 空 token ⇒ logfire 只在进程内运行，绝不向云端发 trace（测试本身就是这么写的）
@@ -117,7 +118,8 @@ jobs:
         run: |
           set -euo pipefail
           for t in tests/test_aivideomaker_video_v1.py tests/test_engine.py \
-                   tests/test_persistence_sqlite.py tests/test_observability.py; do
+                   tests/test_persistence_sqlite.py tests/test_observability.py \
+                   scripts/verify_docs_examples.py; do
             echo "===== ${t}"
             python "$t"
           done

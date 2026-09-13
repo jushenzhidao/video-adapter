@@ -17,6 +17,7 @@ import hmac
 import logging
 import random
 import string
+import time
 from typing import Any, Mapping
 
 from . import media, observability, scriptstore
@@ -33,6 +34,7 @@ from .executor import (
 )
 from .normalize import normalize_payload
 from .queue import ConcurrencyGate
+from .ratelimit import QUERY
 from .settings import Settings
 from .taskstore import TERMINAL_STATUSES, TaskStore
 from .transport import UpstreamClient
@@ -115,6 +117,13 @@ class TaskService:
         self.gate = gate
         self.client = client
         self._background: set[asyncio.Task] = set()
+        #: 查询结果的短 TTL 缓存：`key → (monotonic 截止, 渲染结果)`。
+        #: **这是降频的主力** —— 调用方的轮询间隔通常比上游的限额密，窗口内直接回放，
+        #: 一次上游请求都不发。`upstream_report.query_count` 统计的是**真实上游查询数**，
+        #: 缓存命中**不**计入 —— 那个数字正是我们要压下去的。
+        self._query_cache: dict[tuple[str, str], tuple[float, dict]] = {}
+        #: single-flight：同一任务的并发查询合并成一次上游调用。
+        self._inflight: dict[tuple[str, str], asyncio.Task] = {}
 
     # ------------------------------------------------------------------ 创建
     async def create(
@@ -260,10 +269,42 @@ class TaskService:
 
     # ------------------------------------------------------------------ 查询
     async def get(self, channel: ChannelConfig, local_id: str, *, request_id: str = "") -> dict:
+        """查询任务。**尽量不去打上游** —— 四级降频，越靠前省得越多（架构 §7.2）：
+
+            ① 终态任务 → 本地记录直接渲染（本来就不查上游）；
+            ② TTL 缓存命中 → 回放上一次结果（**0 次**上游请求）；
+            ③ 同一任务的并发查询 → 合并成一次上游调用（single-flight）；
+            ④ 真要打上游 → 过限流桶（排队或让路），并标记查询车道。
+
+        凭证校验**必须在降频之前**：缓存与合并都不得绕过 `_authorize`（否则降频会变成越权）。
+        """
         record = await self._authorize(channel, local_id)
         if record["status"] in TERMINAL_STATUSES:
             return self._render(record)
 
+        # 键含 `credential_id`：local_id 本身全局唯一，把凭证一起放进来是零成本的一道保险
+        # —— 降频**绝不**可以跨凭证复用，那会把 A 的结果给到 B。
+        cache_key = (str(record.get("credential_id") or ""), local_id)
+
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            return cached
+
+        task = self._inflight.get(cache_key)
+        if task is None:
+            task = asyncio.create_task(
+                self._query_upstream(channel, record, request_id=request_id)
+            )
+            self._inflight[cache_key] = task
+            task.add_done_callback(lambda t, key=cache_key: self._retire_inflight(key, t))
+        # shield：某个等待者断开（调用方取消）不该打断在飞的上游查询 —— 其他等待者还在等它。
+        return await asyncio.shield(task)
+
+    async def _query_upstream(
+        self, channel: ChannelConfig, record: dict, *, request_id: str
+    ) -> dict:
+        """真正发一次上游查询（`get` 的第 ④ 步）。"""
+        local_id = record["local_id"]
         script = scriptstore.load(
             self.settings, channel.script_ref, expected_sha256=channel.script_sha256
         )
@@ -290,6 +331,9 @@ class TaskService:
                 channel_url=channel.upstream_url,
                 auth_headers=build_auth_headers(channel),
                 idempotent=True,
+                # **只有查询**走限流桶：上游按 IP 限的就是它（创建/取消不计入配额，
+                # 但它们的 429 仍会回灌冷却 —— 见 ratelimit.py 的 QUERY 注释）。
+                rate_limit_lane=QUERY,
             )
             raise_for_status(result, phase="query")
             fragment = await call_phase(script, "query_response", ctx, result.body)
@@ -299,7 +343,36 @@ class TaskService:
             log.warning("query failed for %s: %s", local_id, exc)
             raise
 
-        return await self._apply_fragment(record, fragment, raw=result.body)
+        rendered = await self._apply_fragment(record, fragment, raw=result.body)
+        # 只在**成功**路径写缓存：失败结果缓存下来会让一次抖动看起来像持续故障。
+        self._cache_put((str(record.get("credential_id") or ""), local_id), rendered)
+        return rendered
+
+    # ------------------------------------------------------------------ 降频辅助
+    def _retire_inflight(self, cache_key: tuple[str, str], task: asyncio.Task) -> None:
+        """查完立刻摘牌。不摘的话，下一次查询会拿到这个**已完成**的结果，而不是重新去查。"""
+        self._inflight.pop(cache_key, None)
+        if not task.cancelled():
+            # 消费掉异常：创建者被取消且没有其他等待者时，它本来会变成
+            # "exception was never retrieved" 噪声。
+            task.exception()
+
+    def _cache_get(self, cache_key: tuple[str, str]) -> dict | None:
+        entry = self._query_cache.get(cache_key)
+        if entry is None:
+            return None
+        expires_at, payload = entry
+        if time.monotonic() >= expires_at:
+            self._query_cache.pop(cache_key, None)
+            return None
+        # 浅拷贝：调用方拿到的顶层键与缓存解耦（嵌套的 content 是只读语义，不必深拷）。
+        return dict(payload)
+
+    def _cache_put(self, cache_key: tuple[str, str], payload: dict) -> None:
+        ttl = max(0.0, float(self.settings.query_cache_seconds))
+        if ttl <= 0:
+            return
+        self._query_cache[cache_key] = (time.monotonic() + ttl, payload)
 
     async def _apply_fragment(self, record: dict, fragment: dict, *, raw: Any = None) -> dict:
         fragment = dict(fragment or {})

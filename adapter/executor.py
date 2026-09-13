@@ -8,6 +8,9 @@
 🔴 **脚本只能改路径，不能改源站。** 渠道的 `X-Upstream-Url` 定义了允许的 origin，
 计划里的 URL 必须落在同一个 origin 上 —— 否则一个被投毒的脚本就能把凭证发到别处。
 脚本是 pinned + review 过的，但这条防线不该只依赖"我们信任脚本"。
+
+`rate_limit_lane` 由调用方（`tasks.py`）按语义给出：查询传 `QUERY`（上游按 IP 限的就是它），
+创建 / 取消不传（不计入配额，但它们的 429 仍会回灌冷却）。见 `ratelimit.py`。
 """
 
 from __future__ import annotations
@@ -90,6 +93,7 @@ async def request_upstream(
     auth_headers: dict[str, str],
     idempotent: bool,
     trace: UpstreamTrace | None = None,
+    rate_limit_lane: str | None = None,
 ) -> tuple[UpstreamResult, dict]:
     """跑 `<x>_request` 相位 → 发一次上游调用 → 返回 (结果, 脚本给出的计划)。"""
     plan = await call_phase(script, request_phase, ctx, payload)
@@ -115,6 +119,7 @@ async def request_upstream(
     result = await client.request(
         method, url, json=body if body else None, headers=headers,
         idempotent=idempotent, trace=_derive_trace(request_phase, ctx, trace),
+        rate_limit_lane=rate_limit_lane,
     )
     return result, plan
 
@@ -143,6 +148,9 @@ def raise_for_status(result: UpstreamResult, *, phase: str) -> None:
 
     2xx 上仍可能是失败信封（上游文档只给了 `{"status":"FAILED","message":…}`，
     **没给 HTTP 状态码**）—— 那是 `*_response` 相位的职责。
+
+    429 会把上游的 `Retry-After` 一起带出去（`errors.from_upstream_http`），
+    否则调用方拿到一个 429 却不知道该等多久。
     """
     if result.ok:
         return
@@ -151,4 +159,4 @@ def raise_for_status(result: UpstreamResult, *, phase: str) -> None:
         message = str(result.body.get("message") or "")
     if not message:
         message = f"upstream returned HTTP {result.status} during {phase}"
-    raise from_upstream_http(result.status, message)
+    raise from_upstream_http(result.status, message, retry_after=result.retry_after)

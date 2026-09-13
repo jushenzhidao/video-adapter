@@ -704,6 +704,30 @@ async def test_healthz_reports_backend_and_queue(client, app, upstream):
     assert "queue" in body and body["logfire"]["configured"] is False
 
 
+@case
+async def test_unreachable_upstream_becomes_502_envelope(client, app, upstream):
+    """连不上上游 → **契约信封**的 502，而不是裸的 500（实测踩到过）。
+
+    这类失败**没有 HTTP 应答**，所以 §10.2 那份"上游状态码 → 出口码"的映射表不适用。
+    不转换的后果：`httpx.ConnectError` 一路冒到 ASGI 层，调用方拿到
+    `Internal Server Error` —— 不在码表里、也没有可判别信息。
+    """
+    with socket.socket() as probe:          # 占一个端口再关掉：保证没人监听
+        probe.bind(("127.0.0.1", 0))
+        dead_port = probe.getsockname()[1]
+
+    response = await client.post(
+        TASKS, json=_body(), headers=Client(f"http://127.0.0.1:{dead_port}").headers
+    )
+    assert response.status_code == 502, response.text
+    error = response.json()["error"]
+    assert error["code"] == "UpstreamUnavailable", error
+    assert error["type"] == "InternalServerError"
+    assert "Connect" in error["message"], error
+    # 消息里不许带 URL（httpx 的异常原文带整条 URL，而 URL 可能含凭证查询串）
+    assert str(dead_port) not in error["message"], error
+
+
 def _run_all() -> int:
     tests = [(n, f) for n, f in sorted(globals().items()) if n.startswith("test_") and callable(f)]
     failed = []

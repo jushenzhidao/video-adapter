@@ -239,10 +239,13 @@ def test_bodies_can_be_switched_off_without_placeholders():
 @case
 async def test_transport_failure_keeps_request_attributes_and_omits_status(client, app, upstream):
     with Recorder() as rec:
-        try:
-            await client.post(TASKS, json=_body(), headers=Client(f"http://127.0.0.1:{_dead_port()}").headers)
-        except Exception:  # noqa: BLE001 - 连接失败会以异常冒到 ASGI 层；这里只关心上报
-            pass
+        response = await client.post(
+            TASKS, json=_body(), headers=Client(f"http://127.0.0.1:{_dead_port()}").headers
+        )
+    # 出口必须是**契约信封**（502 UpstreamUnavailable），不是裸 500 —— 这是同一个
+    # 缺陷的另一半：只断言 span 而不看响应，就会漏掉"调用方拿到 Internal Server Error"。
+    assert response.status_code == 502, response.text
+    assert response.json()["error"]["code"] == "UpstreamUnavailable"
 
     call = rec.one("upstream.call")
     assert call.status == "error"

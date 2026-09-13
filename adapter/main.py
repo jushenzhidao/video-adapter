@@ -13,6 +13,7 @@ import uuid
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
 from . import observability
 from .api import adapter_error_handler, build_router
@@ -81,6 +82,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.add_exception_handler(AdapterError, adapter_error_handler)
     app.include_router(build_router(settings))
+
+    @app.exception_handler(Exception)
+    async def unhandled_exception(request: Request, exc: Exception) -> JSONResponse:
+        """兜底：**任何**未预期异常也要以契约信封出去，绝不给裸 500。
+
+        为什么必须有：调用方是按 `error.code` 做分支判断的，而裸的
+        `500 Internal Server Error` 既不在 `docs/seedance-api-reference.md` 的码表里，
+        也没有 request_id 可对账（实测踩到过：上游不可达时返回的就是它）。
+        traceback 只进服务端日志；消息里只给异常类型名与 request_id ——
+        不把 `str(exc)` 回给调用方（它可能含 URL、内部路径等）。
+        """
+        request_id = observability.current_request_id()
+        log.exception(
+            "unhandled %s on %s %s (request_id=%s)",
+            type(exc).__name__,
+            request.method,
+            request.url.path,
+            request_id,
+        )
+        error = AdapterError(
+            f"unhandled {type(exc).__name__} inside the adapter; "
+            f"see the service log (request_id={request_id})",
+            code="InternalServiceError",
+            type_="InternalServerError",
+        )
+        return JSONResponse(status_code=error.status, content=error.envelope())
 
     @app.middleware("http")
     async def request_context(request: Request, call_next):

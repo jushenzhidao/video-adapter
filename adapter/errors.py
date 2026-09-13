@@ -31,7 +31,12 @@ DEFAULT_CODE = "InternalServiceError"
 
 
 class AdapterError(Exception):
-    """出口错误。`code` 决定 HTTP 状态与 `type`，除非显式覆盖。"""
+    """出口错误。`code` 决定 HTTP 状态与 `type`，除非显式覆盖。
+
+    `retry_after`（秒）在 429 上**必须**给：调用方要靠它决定退避多久，
+    而上游自己也是用 `Retry-After` 表达同一件事的（见 `upstreams/aivideomaker-official-api.md` §6）。
+    不给的话调用方只能瞎猜间隔，反而更容易持续撞线。
+    """
 
     def __init__(
         self,
@@ -40,11 +45,13 @@ class AdapterError(Exception):
         param: str | None = None,
         status: int | None = None,
         type_: str | None = None,
+        retry_after: float | None = None,
     ) -> None:
         super().__init__(message)
         self.message = str(message)
         self.code = code if code in REGISTRY else DEFAULT_CODE
         self.param = param
+        self.retry_after = retry_after
         default_status, default_type = REGISTRY[self.code]
         self.status = int(status) if status is not None else default_status
         self.type = type_ or default_type
@@ -87,12 +94,65 @@ UPSTREAM_HTTP_TO_CODE: dict[int, str] = {
 }
 
 
-def from_upstream_http(status: int, message: str = "") -> AdapterError:
-    """上游非 2xx → 出口错误。5xx 一律落 `InternalServiceError` 并以 **502** 出口（§10.2）。"""
+def from_upstream_http(
+    status: int, message: str = "", retry_after: float | None = None
+) -> AdapterError:
+    """上游非 2xx → 出口错误。5xx 一律落 `InternalServiceError` 并以 **502** 出口（§10.2）。
+
+    `retry_after` 只在 429 上有意义：上游既然给了这个头，就没有理由把它吞掉 ——
+    调用方要靠它决定退避多久（上游文档 §6 就是这么用的）。
+    """
     if status >= 500:
         return AdapterError(
             message or f"upstream returned {status}", code="InternalServiceError", status=502
         )
     code = UPSTREAM_HTTP_TO_CODE.get(status, "InternalServiceError")
     out_status = status if code != "InternalServiceError" else 502
-    return AdapterError(message or f"upstream returned {status}", code=code, status=out_status)
+    return AdapterError(
+        message or f"upstream returned {status}",
+        code=code,
+        status=out_status,
+        retry_after=retry_after,
+    )
+
+
+#: 传输层异常类型 → 给调用方看的一句人话（**不含 URL / 凭证**）。
+#: ⚠️ 刻意不把 `str(exc)` 放进信封：httpx 的异常消息里带整条 URL，
+#: 而 URL 可能含凭证（渠道可以把凭证放进查询串）—— 那会让"给调用方看的错误"
+#: 同时泄露凭证明文到**日志**里。细节留在 span（已打码）与服务端 traceback 里。
+_UNREACHABLE_HINTS: dict[str, str] = {
+    "ConnectError": "connection refused / DNS failure",
+    "ConnectTimeout": "connect timed out",
+    "ReadTimeout": "read timed out (upstream accepted but did not answer)",
+    "WriteTimeout": "write timed out",
+    "PoolTimeout": "connection pool exhausted",
+    "RemoteProtocolError": "upstream closed the connection mid-response",
+    "ReadError": "connection reset while reading the response",
+}
+
+
+def upstream_unreachable(exc: BaseException) -> AdapterError:
+    """连不上上游 / 超时 / 连接中断 → **502 `UpstreamUnavailable`**。
+
+    这类失败**没有 HTTP 应答**，所以没有上游状态码可用（§10.2 的映射表不适用）。
+    不转换的后果是调用方拿到裸的 `500 Internal Server Error` —— 既不在码表里，
+    也不含可判别信息（实测踩到过：本地假上游端口写错，返回的就是它）。
+    """
+    kind = type(exc).__name__
+    hint = _UNREACHABLE_HINTS.get(kind, "transport-level failure")
+    return AdapterError(f"cannot reach the upstream: {kind} ({hint})", code="UpstreamUnavailable", status=502)
+
+
+def local_rate_limited(retry_after: float, detail: str = "") -> AdapterError:
+    """**本地**主动限流把请求挡下了 —— 上游**一次都没被调用**。
+
+    与 `from_upstream_http(429)` 的区别只在 message 里说清"是谁在限"：出口形状相同
+    （契约里 429 就一种），但排障方向正好相反 ——
+    一个要去看上游的配额，一个要看本层的限流配置。混成同一句话会把人送去查错方向。
+    """
+    why = f" ({detail})" if detail else ""
+    return AdapterError(
+        f"query rate limit reached locally; the upstream was not called{why}",
+        code="RateLimitExceeded.ModelAccountRpmExceeded",
+        retry_after=retry_after,
+    )
