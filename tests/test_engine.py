@@ -190,7 +190,6 @@ def make_settings(upstream: FakeUpstream, **overrides) -> Settings:
         "upstream_allow_private_network": True,
         "upstream_trust_env": False,
         "task_store": "memory",
-        "task_store_path": "/tmp/video-adapter-test.sqlite3",
         "script_store_dir": SCRIPT_STORE,
         "task_key_fingerprint_secret": "test-secret",
         "default_max_concurrency": 2,

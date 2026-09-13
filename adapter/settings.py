@@ -48,9 +48,15 @@ class Settings:
     upstream_trust_env: bool = False           # 默认**不信**环境代理：macOS scutil 代理会把回环也代理走
 
     # --- 任务持久化（架构 §6.2）---
-    task_store: str = "sqlite"                 # sqlite | memory | redis
-    task_store_path: str = str(REPO_ROOT / ".tasks.sqlite3")
+    #   redis   生产（唯一）。启动即探测，连不上**直接失败**。
+    #   memory  仅开发的显式开关（启动打 warning）。
+    #   🔴 sqlite 已移除（2026-09-13）：它是单机存储，与"任务与配额跨副本共享"的语义冲突，
+    #      而且容器里还要持久卷 + 单 worker + 优雅停机三件套 —— 收敛掉它，部署形态只剩一种。
+    task_store: str = "redis"
     task_store_url: str = ""                   # redis://…
+    #: 任务记录的 key 前缀（默认 `task`）。**多个部署共用同一个 redis 时必须区分**，
+    #: 否则彼此的列表会互相看见；测试也靠它拿到完全隔离的空间。
+    task_store_key_prefix: str = "task"
     task_retention_days: int = 7
     task_key_fingerprint_secret: str = ""      # 缺失 → 退化 sha256 + 启动告警（§6.3b / ADR-003）
 
@@ -143,9 +149,9 @@ class Settings:
             script_store_dir=_text("SCRIPT_STORE_DIR", str(REPO_ROOT / "script_store")),
             upstream_allow_private_network=_flag("UPSTREAM_ALLOW_PRIVATE_NETWORK", False),
             upstream_trust_env=_flag("UPSTREAM_TRUST_ENV", False),
-            task_store=_text("TASK_STORE", "sqlite"),
-            task_store_path=_text("TASK_STORE_PATH", str(REPO_ROOT / ".tasks.sqlite3")),
+            task_store=_text("TASK_STORE", "redis"),
             task_store_url=_text("TASK_STORE_URL"),
+            task_store_key_prefix=_text("TASK_STORE_KEY_PREFIX", "task"),
             task_retention_days=_num("TASK_RETENTION_DAYS", 7),
             task_key_fingerprint_secret=_text("TASK_KEY_FINGERPRINT_SECRET"),
             media_dir=_text("MEDIA_DIR", str(REPO_ROOT / ".media")),

@@ -37,7 +37,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        store = build_store(settings)          # 缺 Redis ⇒ 这里抛错，不静默降级
+        store = build_store(settings)          # 配置错 ⇒ 这里抛错，不静默降级
+        # 探测持久后端。**连不上就启动失败** —— sqlite 退路已移除，别等到第一个请求才炸。
+        await store.start()
         # 限流装配（§7.1）：上游按 IP 限 60 次/分钟，本层在**发出去之前**排队或让路。
         # 关闭时返回 None（传输层整段跳过），并在启动日志里说明"只剩被动退避"。
         limiter = build_rate_limiter(settings)

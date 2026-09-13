@@ -210,7 +210,6 @@ def settings_for(**overrides) -> Settings:
         "upstream_allow_private_network": True,
         "upstream_trust_env": False,
         "task_store": "memory",
-        "task_store_path": "/tmp/video-adapter-ratelimit-test.sqlite3",
         "script_store_dir": SCRIPT_STORE,
         "task_key_fingerprint_secret": "test-secret",
         "default_max_concurrency": 4,
@@ -529,7 +528,6 @@ def _limiter(*, store: str, prefix: str, burst: int):
     settings = Settings.from_env(
         adapter_key="x",
         task_store="memory",
-        task_store_path="/tmp/video-adapter-ratelimit-test.sqlite3",
         rate_limit_store=store,
         rate_limit_store_url=TEST_REDIS_URL if store == "redis" else "",
         rate_limit_key_prefix=prefix or "ratelimit",

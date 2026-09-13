@@ -132,7 +132,7 @@ jobs:
         run: |
           set -euo pipefail
           for t in tests/test_aivideomaker_video_v1.py tests/test_engine.py \
-                   tests/test_persistence_sqlite.py tests/test_observability.py \
+                   tests/test_persistence_redis.py tests/test_observability.py \
                    tests/test_rate_limit.py \
                    scripts/verify_docs_examples.py; do
             echo "===== ${t}"

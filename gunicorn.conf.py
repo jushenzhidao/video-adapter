@@ -11,12 +11,13 @@
   ⚠️ worker_class 写 `uvicorn_worker.UvicornWorker` **不是** `uvicorn.workers.UvicornWorker`：
   后者在 uvicorn 0.52 上会打印 `DeprecationWarning`（实测），官方指定改用 `uvicorn-worker` 包。
 - 🔴 **`workers` 默认 1，这与同类项目的"一核一 worker"相反，理由是状态**：
-  ① 并发闸门 `ConcurrencyGate` 是**进程内**状态（槽位从创建占到终态）—— 多 worker 会让
-     同一渠道的并发上限被放大成 `N × limit`，闸门形同虚设；
-  ② 默认任务后端是 **sqlite 单文件**，多 worker 并发写会互相抢锁。
-  ⇒ 要开多 worker，必须同时满足：`TASK_STORE=redis`（共享任务表）**且**接受
-  "闸门按 worker 各自计数"这一语义变化。`WEB_CONCURRENCY` 可覆盖。
+  并发闸门 `ConcurrencyGate` 是**进程内**状态（槽位从创建占到终态）—— 多 worker 会让
+  同一渠道的并发上限被放大成 `N × limit`，闸门形同虚设。
+  ⇒ 要开多 worker，必须接受"闸门按 worker 各自计数"这一语义变化。`WEB_CONCURRENCY` 可覆盖。
   高可用靠**多副本 + 共享存储**（见 docker-compose.yml），不是靠单容器的 worker 数。
+  ✅ **任务表与限流桶不再是这条约束的理由**：两者都在 redis 上
+  （`TASK_STORE=redis`；`RATE_LIMIT_STORE` 留空即跟随），多 worker / 多副本共享同一份状态。
+  （sqlite 后端已移除 —— 它那种"多进程抢单文件锁"的问题随之消失。）
 
 ## 超时：这是**存活看门狗**，不是请求预算
 
@@ -57,7 +58,7 @@ def _str_env(name: str, default: str) -> str:
 
 bind = f"0.0.0.0:{_int_env('PORT', 8000)}"
 
-#: ⚠️ 默认 1。见模块 docstring：本服务的并发闸门是进程内状态、默认任务后端是 sqlite。
+#: ⚠️ 默认 1。见模块 docstring：并发闸门是**进程内**状态（任务表与限流桶已经在 redis 上）。
 #: 想开多 worker：先切 `TASK_STORE=redis`，再改这个值。
 workers = _int_env("WEB_CONCURRENCY", 1)
 

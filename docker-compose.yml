@@ -1,14 +1,16 @@
-# video-adapter —— 默认**单副本 + 持久卷**，高可用形态按需切换。
+# video-adapter —— 默认形态：**1 副本 + 共享 redis**。
 #
 # 与同类项目（image-adapter 那种无状态代理）的关键差异：**本服务有状态**。
-#   ① 任务表必须活过重启 —— 契约要求 `GET /tasks/{id}` 在 7 天内可用（§6.2），
-#      所以容器重建不能把任务记录一起带走 ⇒ 必须有持久卷；
-#   ② 并发闸门 `ConcurrencyGate` 是**进程内**状态 ⇒ 副本数会影响闸门语义（见文末）。
-# 于是这里的默认形态是「1 副本 + 命名卷 + sqlite」，而不是"副本随便开"。
+#   ① 任务表必须活过重启 —— 契约要求 `GET /tasks/{id}` 在 7 天内可用（§6.2）；
+#   ② 配额也必须有状态 —— 上游按 IP 限流，桶要跨进程共享（§7.1）。
+# 所以默认就带上 redis：**任务表与限流桶共用它**（`RATE_LIMIT_STORE` 留空即跟随 `TASK_STORE`）。
+#
+# 🔴 为什么没有 sqlite：它曾是"无 redis 部署的合规降级"，但单机存储与上面两条
+#    （跨副本共享）直接冲突 —— 留着它等于长期维护一条注定不可用的部署路径。见 `taskstore.py`。
 #
 # 起法：
-#   cp .env.example .env      # 至少填 ADAPTER_KEY 与 TASK_KEY_FINGERPRINT_SECRET
-#   docker compose up -d
+#   cp .env.example .env      # 填 ADAPTER_KEY、TASK_KEY_FINGERPRINT_SECRET
+#   docker compose up -d      # redis 会一起起来
 #   curl -s localhost:8000/healthz
 
 services:
@@ -20,7 +22,7 @@ services:
     restart: unless-stopped
 
     # ⚠️ 刻意**不写 container_name**：写了就只能跑一个副本（`--scale` 会报名字冲突），
-    # 而高可用恰恰要多副本。代价是容器名由 compose 生成（`video-adapter-adapter-1`）。
+    # 而扩容恰恰要多副本。代价是容器名由 compose 生成（`video-adapter-adapter-1`）。
     ports:
       # 单副本形态的便利映射；多副本时必须删掉这一行（见文末）。
       - "${PORT:-8000}:8000"
@@ -33,10 +35,14 @@ services:
     environment:
       # 容器内端口（gunicorn 读 PORT）；宿主映射由上面那行决定。
       PORT: 8000
-      # 任务表与转存产物都落到**卷**里：容器重建/滚动发布都不能丢任务。
-      TASK_STORE_PATH: /app/data/tasks.sqlite3
+      # 任务表与限流桶：**同一个 redis**。
+      # （多个部署共用同一个 redis 时，各自设 *_KEY_PREFIX 隔离。）
+      TASK_STORE: redis
+      TASK_STORE_URL: redis://redis:6379/0
+      # 转存产物仍落卷 —— 它是文件，与"状态共享"是两件事。
       MEDIA_DIR: /app/data/media
-      # 默认 1：并发闸门是进程内状态、任务后端是 sqlite（见 gunicorn.conf.py 的长注释）。
+      # 默认 1：**并发闸门是进程内状态**（见文末的语义提醒）。
+      # 任务表已经是共享的，所以这个值可以按 CPU 调；闸门精度代价仍按 副本×worker 计。
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-1}
 
     volumes:
@@ -56,23 +62,21 @@ services:
     # 健康检查用**镜像里自带**的那条（Dockerfile 的 HEALTHCHECK，走 /healthz 且绕开代理），
     # 不在这里重复写一份：两份定义迟早会漂移，而"哪份是真的"没人知道。
 
-  # 共享后端（可选，只在多副本 / 多 worker 时需要）。它同时承担两件事：
-  #   ① **任务表** —— 7 天契约要求任务记录跨副本共享；
+  # 共享状态后端。**必需**，所以没有 profile。
+  # 它同时承担两件事：
+  #   ① **任务表** —— 7 天契约要求任务记录跨副本共享，且必须活过重启；
   #   ② **限流桶** —— 上游按 IP 限流 ⇒ 配额属于出口身份 ⇒ 所有副本必须共享同一个桶（§7.1）。
-  #      `RATE_LIMIT_STORE` 留空时会**自动跟随 `TASK_STORE`**，所以把任务表切到 redis 之后，
+  #      `RATE_LIMIT_STORE` 留空时会**自动跟随 `TASK_STORE`**，所以这里配了 redis，
   #      限流桶跟着一起共享了，不需要额外配置。
   #
-  # 为什么不是默认启动：单副本时 sqlite + 命名卷已经满足 7 天契约，多一个要运维的组件
-  # 没有收益。开启后才需要 `TASK_STORE=redis` + `TASK_STORE_URL=redis://redis:6379/0`。
-  #
-  # ⚠️ 刻意不写 depends_on：连不上 redis 时本服务会**明确报错退出**，而不是静默退化成
-  #    进程内存储（那会让重启后的 GET 变成 404，而调用方以为任务还在跑 —— 直接违约）。
+  # ⚠️ 刻意不写 depends_on：连不上 redis 时本服务会**明确报错退出**（`RedisStore.start()`
+  #    在 lifespan 里做启动探测），而不是静默退化成进程内存储
+  #    （那会让重启后的 GET 变成 404，而调用方以为任务还在跑 —— 直接违约）。
   #    启动顺序交给编排层重试，不由 compose 的隐式顺序保证。
   redis:
     image: redis:7-alpine
-    profiles: ["shared-store"]
     restart: unless-stopped
-    # appendonly：任务表是**契约数据**，不能只放内存。
+    # appendonly：任务记录是**契约数据**（7 天窗口），不能只放内存。
     command: ["redis-server", "--appendonly", "yes", "--save", "60", "1000"]
     volumes:
       - redis-data:/data
@@ -83,25 +87,20 @@ volumes:
   redis-data:
 
 # ---------------------------------------------------------------------------
-# 高可用（多副本）形态：三处一起改，缺一不可
+# 扩容（多副本）：两处一起改
 #
 #   1) 删掉 adapter 的 `ports:` —— 固定宿主端口无法被多个副本共享；
 #      入口交给前置代理（nginx / traefik / 云 LB）或 docker compose 之外的编排层。
-#   2) 打开共享存储：.env 里 `TASK_STORE=redis`、`TASK_STORE_URL=redis://redis:6379/0`，
-#      并让 redis 参加：
-#         docker compose --profile shared-store up -d --scale adapter=3
-#   3) 确认 `WEB_CONCURRENCY` 不要跟着一起放大 —— 见下面的语义提醒。
+#   2) `docker compose up -d --scale adapter=3`
+#      任务表与限流桶**本来就是共享的**（同一个 redis），不需要额外配置。
+#      ⚠️ 唯一要注意的：多个**部署**共用同一个 redis 时，各自设
+#      `TASK_STORE_KEY_PREFIX` / `RATE_LIMIT_KEY_PREFIX` 做隔离，
+#      否则彼此的列表会互相看见、限流桶也会互相影响。
 #
 # ⚠️ **语义提醒（不可绕过）**：并发闸门的槽位是**进程内**计数，从任务创建占到终态。
-#    `副本数 × WEB_CONCURRENCY` 等于同一渠道的实际并发上限被放大这么多倍。
-#    也就是说：横向扩容换的是吞吐与可用性，**代价是闸门不再精确**。
-#    若闸门必须精确（例如上游按并发限流会直接拒绝），请让渠道侧
-#    `X-Channel-Options.max_concurrency` 按"单进程上限"配置，或保持单进程。
+#    `副本数 × WEB_CONCURRENCY` 等于同一渠道的实际并发上限被放大这么多倍 ——
+#    这是扩容唯一的精度代价。若闸门必须精确（例如上游按并发硬限流会直接拒绝），
+#    请让渠道侧 `X-Channel-Options.max_concurrency` 按"单进程上限"配置，或保持单进程。
 #
-#   ✅ **限流桶不受这条影响**（`RATE_LIMIT_STORE`，见 §7.1）：上游按 **IP** 限 60 次/分钟 ⇒
-#      配额属于**出口身份** ⇒ 用 `redis` 后端让所有副本**共享同一个桶**
-#      （Lua 脚本 + **Redis 服务器时钟**）。留空即跟随 `TASK_STORE` —— 上面第 2 步已经把
-#      任务表放到 redis 了，限流桶会自动跟上，不需要额外配置。
-#      只有仍用 `process` 时才需要把 rpm 按进程数**整除**（3 副本 × 1 worker、希望整体
-#      ≤30/min ⇒ 每进程配 10），并用 `/healthz` 的 `rate_limit.scope` 确认它没有假装共享。
+#   ✅ **任务表与限流桶不受这条影响**：两者都在 redis 上，所有副本看到同一份状态。
 # ---------------------------------------------------------------------------

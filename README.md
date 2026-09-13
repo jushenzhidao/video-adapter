@@ -23,7 +23,7 @@ Seedance 是一份**规范化的超集协议**：文生视频 / 图生视频（�
 | [`docs/adapter-playbook.md`](docs/adapter-playbook.md) | **怎么投影**：上游三形态归类、`content[]` 降维矩阵与判定准则、参数降维策略、产物回填、回调形状转换、并发与幂等、计费护栏、14 项零消耗测试清单 | 适配方法论（与具体上游无关） |
 | [`docs/03_引擎架构.md`](docs/03_引擎架构.md) | **服务怎么搭**：渠道契约（11 个头）、脚本契约（相位 + `ctx`）、任务持久化、模块划分、实施顺序 | 引擎架构（**取代 playbook §10 的分层清单**） |
 | [`docs/upstreams/aivideomaker-official-api.md`](docs/upstreams/aivideomaker-official-api.md) | **上游长什么样**：aivideomaker 官方线 8 个模型的字段表与类型、计费公式、状态、限流，以及**与旧实现的 6 处差异核对** | 上游契约（脚本逐条实现本文件） |
-| [`docs/decisions/`](docs/decisions/) | **为什么这么做**：`OPEN-DECISIONS.md`（悬而未决登记册，只追加 + 就地关闭）＋ `ADR-001…005`（已锁定的架构决策及其代价） | 决策台账（每次开工先复现未决项） |
+| [`docs/decisions/`](docs/decisions/) | **为什么这么做**：`OPEN-DECISIONS.md`（悬而未决登记册，只追加 + 就地关闭）＋ `ADR-001…008`（已锁定的架构决策及其代价） | 决策台账（每次开工先复现未决项） |
 
 ## 前门契约速查
 
@@ -82,7 +82,7 @@ DELETE /api/v3/contents/generations/tasks/{id}   → 取消（仅 queued 可取�
 - [x] **可观测（span / Logfire）接线**：每次上游调用带 **request/response 原文 + 上游 task id**，
       凭证在源头打码；字段表见 [`docs/03_引擎架构.md`](docs/03_引擎架构.md) §12，
       决策见 [`ADR-006`](docs/decisions/ADR-006-report-fidelity.md)
-- [x] 四套测试共 **118 项**全绿，零消耗（见下）
+- [x] 五套测试共 **137 项**全绿，零消耗（见下；其中 6+2 项需要真 redis）
 - [x] **容器化与发版**：`Dockerfile`（非 root / 只读根 / 自带健康检查）＋ `gunicorn.conf.py`
       （高可用调参，理由写在文件里）＋ `docker-compose.yml`（默认单副本 + 持久卷；多副本形态见文末）
       ＋ `.github/workflows/release.yml`（**push main 即自增 patch**，人工 tag 留给不兼容变更，
@@ -98,8 +98,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # 四套测试：全部零消耗（零网络、零真实生成请求）
 python tests/test_aivideomaker_video_v1.py    # 68 项 翻译层
-python tests/test_engine.py                   # 31 项 引擎端到端（本地假上游）
-python tests/test_persistence_sqlite.py       #  1 项 重启后仍能 GET
+python tests/test_engine.py                   # 32 项 引擎端到端（本地假上游）
+python tests/test_rate_limit.py               # 18 项 限流与降频（12 项进程内 + 6 项需 redis）
+python tests/test_persistence_redis.py        #  2 项 重启后仍能 GET（跨实例可见）+ 连不上 redis 启动失败
 python tests/test_observability.py            # 17 项 上报内容（离线；logfire 不在场会红）
 
 # 文档门禁：把 README「接入示例」那一节当断言跑（零成本、只打本地假上游）

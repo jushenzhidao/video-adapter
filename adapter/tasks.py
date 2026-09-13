@@ -667,7 +667,7 @@ class TaskService:
         return touched
 
     async def _scan_active(self) -> list[dict]:
-        """扫描未终态任务。memory/sqlite/redis 三种后端都用一致的窄接口实现。"""
+        """扫描未终态任务。memory / redis 两种后端都用一致的窄接口实现。"""
         scan = getattr(self.store, "scan_active", None)
         if callable(scan):
             return await scan()

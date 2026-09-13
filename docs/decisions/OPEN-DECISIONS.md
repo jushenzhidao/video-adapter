@@ -6,13 +6,13 @@
 >
 > 三类 slug：`waiting-on-external-condition` / `design-decision-to-evaluate` / `existing-design-boundary`
 
-**汇总：4 已决 · 8 未决**
+**汇总：5 已决 · 7 未决**
 
 | Date | Source | Open Item | Related Constraints | Current Leaning | Blocked By | Resolves When | Status |
 |------|--------|-----------|---------------------|-----------------|------------|---------------|--------|
 | 2026-09-13 | 上游文档 §7 差异 3 | **上游有无计费前闸门** | 上游只列 `key`/`Content-Type`/`webhookUrl` 三个头；越界信封是 `{"status":"FAILED","message":"Insufficient credits"}` | 无闸门 ⇒ 上限只能由本层本地估算强制 | — | — | **RESOLVED**（2026-09-13 用户确认：**上游确实没有计费前闸门**）。Resolution：支出上限完全由本地强制 —— 拿不到 `max_credits` → 400；本地估算 > 上限 → 400；**动态计价模型（`seedance20`）无法估算 ⇒ 必须显式 opt-in 才允许提交**（`X-Channel-Options.allow_unpriced` 或 `extra_body.aivideomaker_allow_unpriced`），否则 400。渠道可用 `credit_table` 给动态模型补费率，从而恢复可估。见 `ADR-004` |
 | 2026-09-13 | §6.3b | **凭证指纹密钥的轮换策略** | 指纹 = `HMAC-SHA256(secret, key)`，存在任务记录里；**换 secret 会让所有存量任务读不出**（算出的指纹与记录不符 → 404），最长影响 7 天 | 目前只支持单 secret。倾向：支持**双密钥验证窗口**（`SECRET` + `SECRET_PREVIOUS`），新任务用新密钥，查询时两把都试 | 需要一个"轮换窗口 ≥ 任务保留期"的运维约定 | 决定是否实现双密钥（或接受"轮换即放弃存量任务"） | OPEN · `design-decision-to-evaluate` |
-| 2026-09-13 | §6.2 | **生产任务后端选型** | 契约要求 `GET` 在 7 天窗口可用；multi-instance 下必须共享存储 | sqlite 单实例即可，已验证重启不丢；多实例必须 redis | 等部署拓扑（单实例还是多副本） | 部署方案确定后 | OPEN · `waiting-on-external-condition` |
+| 2026-09-13 | §6.2 | **生产任务后端选型** | 契约要求 `GET` 在 7 天窗口可用；multi-instance 下必须共享存储 | `redis` 唯一生产后端 | — | — | **RESOLVED**（2026-09-13 用户指令：**「video-adapter 不要 sqlite」**）。Resolution：**移除 sqlite 后端**，收敛为 `redis`（唯一生产）+ `memory`（仅开发的显式开关）。理由不是"sqlite 不可靠"，而是它与服务方向冲突：① 单机存储 vs "任务与配额跨副本共享"的语义（限流桶按出口 IP 共享、任务表要被任一副本读到）；② 容器里还要持久卷 + 单 worker + 优雅停机三件套；③ 两套后端 = 两套测试路径与两种部署形态，而其中一条在多副本下必然失效。配套：`RedisStore.start()` 在 lifespan 里做**启动探测**（连不上直接失败，不再有 sqlite 退路）；key 布局从"靠单复数区分命名空间"改成显式 `TASK_STORE_KEY_PREFIX`；`test_persistence_sqlite.py` → `test_persistence_redis.py`（而且现在验证的是**跨实例可见** —— 那正是 sqlite 做不到的事）。见 `taskstore.py` 模块 docstring |
 | 2026-09-13 | §2.5 | **DELETE 的响应形状** | 上游文档未规定；Seedance 契约只规定语义（`queued` 取消 / 终态删除） | 现在：`queued` → 返回任务对象（status=cancelled）；终态 → `{"id":…,"deleted":true}` | 官方文档未见 DELETE 响应示例 | 找到官方响应示例，或确认自定义形状可接受 | OPEN · `design-decision-to-evaluate` |
 | 2026-09-13 | §10.1 | **"任务不存在"用哪个错误码** | 官方码表没有专门的 task-not-found | 复用 `InvalidEndpoint.NotFound`（404）—— 与"未知 provider"同码，**不泄露"它存在但不属于你"** | 官方码表无对应项 | 找到官方码表里的对应项 | OPEN · `existing-design-boundary` |
 | 2026-09-13 | §10.2 | **本地并发满用哪个错误码** | 官方码表里 429 的几个 code 都指上游侧瓶颈 | 暂用 `ServerOverloaded`（429），message 明说"本地闸门满" | 官方码表无"调用方并发超限"这一类 | 找到更贴切的官方 code | OPEN · `design-decision-to-evaluate` |
