@@ -1,0 +1,15 @@
+# --- 运行时 ---
+fastapi>=0.115
+uvicorn[standard]>=0.30
+httpx>=0.27
+pydantic>=2.7
+
+# --- 上报（可观测）---
+# 未配置 LOGFIRE_TOKEN 时只在本地收集，不外发；没装这个包也能起（装配失败只降级）。
+# ⚠️ 不引入 opentelemetry-instrumentation-* ：自动埋点的属性集不由我们控制，
+#    本项目的上报字段表是契约，自己写（见 adapter/observability.py）。
+logfire>=5.0
+
+# --- 任务后端 ---
+# sqlite 用标准库，无需依赖。多实例部署用 Redis：
+# redis>=5.0

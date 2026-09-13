@@ -1,0 +1,13 @@
+{
+  "scripts": {
+    "aivideomaker/video": {
+      "latest": "v1",
+      "aliases": {
+        "stable": "v1"
+      },
+      "digests": {
+        "v1": "f3fb92d560bd03d225e58d5dbbd203e8d2f51aa057c8fff16bdfc63d21108ad6"
+      }
+    }
+  }
+}
