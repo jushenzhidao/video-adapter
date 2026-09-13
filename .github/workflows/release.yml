@@ -31,6 +31,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          # 检出**要发布的那个 tag**，而不是默认分支。
+          # 🔴 实测踩到过：派发式补跑（workflow_dispatch）时 HEAD 是 main 的最新提交，
+          # 于是"给旧 tag 补发一次"会用 main 的代码构建、并把 `:<version>` 与 `:latest`
+          # 指过去（`sha-` 也从 main 的提交出）—— 镜像内容与该 tag 的承诺不再对应。
+          ref: ${{ inputs.tag || github.ref }}
           # 取"上一个版本 tag"要历史；浅克隆会让 changelog 范围退化。
           fetch-depth: 0
 
