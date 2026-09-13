@@ -29,7 +29,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # 取"上一个版本 tag"要历史；浅克隆会让 changelog 范围退化。
           fetch-depth: 0
@@ -52,7 +52,7 @@ jobs:
           echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
           echo "releasing ${TAG} as ${TAG#v}"
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
           cache: pip
@@ -128,6 +128,13 @@ jobs:
         run: |
           set -euo pipefail
           TAG='${{ steps.ver.outputs.tag }}'
+          # 可重跑：同一个 tag 重跑本 job（失败重试、或改了 workflow 后补跑）时，
+          # Release 已存在就跳过而不是报 "already exists" 变红。镜像那一步本来就是
+          # 幂等的（同 tag 覆盖推），这里补上另一半，整条流水线才是真正的可重入。
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists -- skipping creation"
+            exit 0
+          fi
           # 不用 --generate-notes：它依赖已合并的 PR，本仓库直推 main，实测只产出一行
           # compare 链接。notes 由上面的 git log 生成。
           gh release create "$TAG" --title "$TAG" --notes-file CHANGELOG.md
