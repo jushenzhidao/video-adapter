@@ -629,18 +629,25 @@ def _attach_logging_bridge(logfire: Any) -> None:
 
 
 def flush_spans(timeout_millis: int = 5_000) -> bool:
-    """退出前排空批量队列（daemon 线程 + 无 atexit ⇒ 不 flush 就丢）。"""
+    """退出前排空批量队列（daemon 线程 + 无 atexit ⇒ 不 flush 就丢）。
+
+    **必打一行日志**：停机期间"有没有把 span 排空"是运维唯一能核的事实，
+    静默成功与静默丢数据在日志上长得一样。未装配时也照实说（"未装配"≠"排空了"）。
+    """
     if not _STATE.ready:
+        log.info("退出前 flush：未装配 logfire，无需排空（本地记录不受影响）")
         return True
     try:
         import logfire
 
         flushed = bool(logfire.force_flush(timeout_millis=timeout_millis))
     except Exception as exc:  # noqa: BLE001
-        log.debug("force_flush 失败：%s", exc)
+        log.warning("退出前 flush 失败（%s）；队列里的 span 可能丢", exc)
         return False
-    if not flushed:
-        log.warning("logfire flush 在 %d ms 内未完成，队列里的 span 会丢", timeout_millis)
+    if flushed:
+        log.info("退出前 flush：已排空（timeout=%dms）", timeout_millis)
+    else:
+        log.warning("退出前 flush 在 %d ms 内未完成，队列里的 span 会丢", timeout_millis)
     return flushed
 
 
