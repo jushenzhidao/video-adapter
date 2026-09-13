@@ -113,12 +113,24 @@ docker compose up -d --build
 curl -s localhost:8000/healthz      # 里面能看到 version / logfire / queue 三块状态
 ```
 
-**发版**（打 tag 即发布，工作流会跑测试 → 推镜像 → 建 Release）：
+**发版**（两条入口，工作流都会跑测试 → 推镜像 → 建 Release）：
 
 ```bash
-git tag -a v0.1.1 -m "Release v0.1.1" && git push origin v0.1.1
-docker pull ghcr.io/jushenzhidao/video-adapter:0.1.1   # 镜像 tag 不带 v 前缀
+# ① 日常：push 到 main 即**自增 patch** 并发布（v0.1.0 → v0.1.1 → …）
+git push origin main
+
+# ② 需要 minor/major、或契约不向后兼容时：人工打 tag，不做自动递增
+git tag -a v0.2.0 -m "Release v0.2.0" && git push origin v0.2.0
+
+# ③ 补发某个已存在的 tag（可重入：检出的就是该 tag，Release 已存在则跳过）
+gh workflow run release.yml -f tag=v0.1.0
+
+docker pull ghcr.io/jushenzhidao/video-adapter:latest   # 镜像 tag 不带 v 前缀
 ```
+
+⚠️ 纯文档 / CI 自身的提交不该切版本时，在 commit message 里写中括号的 skip release 标记
+（字面量见 workflow 的 `if:`）—— 它匹配整条 message，所以"描述这个标记"的提交自己也会被跳过。
+自动递增只覆盖 patch：**对外契约发生变化时必须走 ②**，由人决定版本号。
 
 扩容/高可用的三处改动、以及"并发闸门是进程内状态"这条语义代价，见
 [`docs/03_引擎架构.md`](docs/03_引擎架构.md) §16 与 `docker-compose.yml` 文末。

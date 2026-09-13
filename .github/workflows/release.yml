@@ -1,14 +1,23 @@
 name: Release
 
-# 版本号由**人**决定：`git tag -a v0.1.1 -m "Release v0.1.1" && git push origin v0.1.1`。
+# 三条入口，一条流水线：
 #
-# 为什么不采用 image-adapter 那套"push main 即自增 patch"：
-# 本项目的对外契约是**Seedance 协议投影 + 上报字段表**（见 docs/03_引擎架构.md §12），
-# 而日常 push 里混着文档、记忆与重构。自动发版会把"契约没变"和"契约变了"混成同一条
-# 时间线，调用方无法据此判断能不能升。tag 即承诺：**谁打 tag，谁对兼容性负责。**
-# （要改回自动递增：把 on.push.branches 打开，递增逻辑见下方注释保留的那段。）
+#   ① push 到 main            → **自增 patch** 并发布（v0.1.0 → v0.1.1 → …）  ← 日常路径
+#   ② push tag `v*.*.*`       → 发布该 tag，**不 bump**（要 minor/major 时人工打 tag）
+#   ③ workflow_dispatch -f tag=… → 补发某个已存在的 tag（可重入）
+#
+# 为什么自动递增之外还保留 ②：自动只覆盖 patch。当"协议投影 / 上报字段表"这类**对外契约**
+# 变化（可能不向后兼容）时，版本号必须由人决定 —— 那条路走 ②，tag 即承诺。
+#
+# 逃生阀：纯文档或 CI 自身的提交不该切版本时，在 commit message 里写中括号的 skip release
+# 标记（字面量见下方 if 条件）。⚠️ 它匹配**整条 message**，所以"描述这个逃生阀"的那次提交
+# 自己也会被跳过 —— 那类提交要么紧跟着真正要发的提交一起进主干，要么用 ③ 补发。
+#
+# 自我触发：模式 ① 会自己 push 新 tag。GITHUB_TOKEN 推送的事件**不会**触发其他 workflow，
+# 所以不会绕回来；另加 `actor != github-actions[bot]` 兜底 —— 将来若换成 PAT 推送也不自激。
 on:
   push:
+    branches: [main]
     tags: ['v[0-9]*.[0-9]*.[0-9]*']
   workflow_dispatch:
     inputs:
@@ -17,45 +26,79 @@ on:
         required: true
 
 permissions:
-  contents: write    # 建 Release（tag 由人推，不由本 job 推）
+  contents: write    # 打 tag（模式 ①）+ 建 Release
   packages: write    # 推 ghcr
 
-# 同一 tag 不并发；但**不取消**已在跑的（取消会留下"镜像推了、Release 没建"的半成品）。
+# 同一 ref 不并发：两次 push main 会算出**同一个**下一个版本号并抢同一个 tag，必须串行；
+# 且**不取消**已在跑的（取消会留下"镜像推了、tag 没打"的半成品）。
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   release:
+    # 逃生阀 + 自我触发兜底。workflow_dispatch 没有 head_commit，用 || '' 兜底。
+    if: ${{ github.actor != 'github-actions[bot]' && !contains(github.event.head_commit.message || '', '[skip release]') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
-          # 检出**要发布的那个 tag**，而不是默认分支。
-          # 🔴 实测踩到过：派发式补跑（workflow_dispatch）时 HEAD 是 main 的最新提交，
-          # 于是"给旧 tag 补发一次"会用 main 的代码构建、并把 `:<version>` 与 `:latest`
-          # 指过去（`sha-` 也从 main 的提交出）—— 镜像内容与该 tag 的承诺不再对应。
+          # 检出**要发布的那个 ref**：tag 触发 → 该 tag；派发式补发 → inputs.tag；
+          # push main（自动 bump）→ 该分支。
+          # 🔴 不写这一行时，派发式补发会检出默认分支，用主干代码构建并覆盖旧 tag 的镜像。
           ref: ${{ inputs.tag || github.ref }}
-          # 取"上一个版本 tag"要历史；浅克隆会让 changelog 范围退化。
+          # 算版本号与 changelog 范围都要历史 tag；浅克隆会让两者一起退化。
           fetch-depth: 0
 
       - name: Resolve version
         id: ver
         run: |
           set -euo pipefail
-          # workflow_dispatch 走 inputs.tag；tag 触发走 ref_name。
-          TAG='${{ inputs.tag }}'
-          if [ -z "$TAG" ]; then TAG='${{ github.ref_name }}'; fi
+          INPUT='${{ inputs.tag }}'
+          REF='${{ github.ref }}'
+          if [ -n "$INPUT" ]; then
+            MODE=tag; TAG="$INPUT"                 # ③ 补发指定 tag
+          elif [ "${REF#refs/tags/}" != "$REF" ]; then
+            MODE=tag; TAG="${REF#refs/tags/}"      # ② 人工打 tag
+          else
+            MODE=auto                              # ① push main：自增 patch
+          fi
+
+          # 上一个版本 tag：用 --sort=-v:refname 而非 git describe —— 后者取"最近可达的 tag"，
+          # 有合并历史时会挑错版本；字典序还会把 v1.9.0 判为新于 v1.10.0。
+          # glob 顺带排除 latest 这类滚动指针。
+          PREV="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1)"
+
+          if [ "$MODE" = "auto" ]; then
+            BASE="${PREV:-v0.0.0}"        # 零 tag 仓库的冷启动
+            CORE="${BASE#v}"
+            MAJOR="${CORE%%.*}"
+            REST="${CORE#*.}"
+            MINOR="${REST%%.*}"
+            PATCH="${REST#*.}"
+            PATCH="${PATCH%%[-+]*}"        # 预发布后缀会打断 $(( )) 算术，先剥掉
+            TAG="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+            END=HEAD
+          else
+            END="$TAG"
+          fi
+
           case "$TAG" in
             v[0-9]*.[0-9]*.[0-9]*) ;;
             *) echo "::error::tag '$TAG' does not match v<major>.<minor>.<patch>"; exit 1 ;;
           esac
-          echo "tag=${TAG}"                            >> "$GITHUB_OUTPUT"
-          # ⚠️ 镜像 tag **不带 v 前缀**（git tag 带、镜像不带，这不是笔误）
-          echo "version=${TAG#v}"                      >> "$GITHUB_OUTPUT"
-          echo "sha=$(git rev-parse --short=7 HEAD)"   >> "$GITHUB_OUTPUT"
-          echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-          echo "releasing ${TAG} as ${TAG#v}"
+
+          {
+            echo "mode=${MODE}"
+            echo "tag=${TAG}"
+            echo "prev=${PREV}"
+            echo "end=${END}"
+            # ⚠️ 镜像 tag **不带 v 前缀**（git tag 带、镜像不带，这不是笔误）
+            echo "version=${TAG#v}"
+            echo "sha=$(git rev-parse --short=7 HEAD)"
+            echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          } >> "$GITHUB_OUTPUT"
+          echo "mode=${MODE} prev=${PREV:-<none>} -> ${TAG}"
 
       - uses: actions/setup-python@v7
         with:
@@ -82,24 +125,25 @@ jobs:
       - name: Build changelog
         run: |
           set -euo pipefail
+          PREV='${{ steps.ver.outputs.prev }}'
           TAG='${{ steps.ver.outputs.tag }}'
+          END='${{ steps.ver.outputs.end }}'
           REPO_URL='https://github.com/${{ github.repository }}'
-          # 上一个版本 tag：`${TAG}^` 把注解 tag peel 到父提交，所以不会取到自己；
-          # 首个 release 时 describe 失败 ⇒ 列出全部可达 commit（限长，避免正文过大）。
-          if PREV="$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "${TAG}^" 2>/dev/null)"; then
-            {
-              printf '**Full changelog**: %s/compare/%s...%s\n\n' "$REPO_URL" "$PREV" "$TAG"
-              printf '## Changes since %s\n\n' "$PREV"
-              git log --no-merges --pretty='- %s (%h)' "${PREV}..${TAG}"
-            } > CHANGELOG.md
-          else
+          if [ -z "$PREV" ]; then
             {
               printf '## Initial release\n\n'
               printf '首个版本：**任意视频生成上游 → 火山方舟 Seedance 协议**的适配层。\n\n'
               printf '容器：`ghcr.io/%s:%s`（另带 `latest` 与 `sha-%s`）\n\n' \
                 '${{ github.repository }}' '${{ steps.ver.outputs.version }}' '${{ steps.ver.outputs.sha }}'
               printf '## commits\n\n'
-              git log --no-merges --pretty='- %s (%h)' --max-count=50 "${TAG}"
+              # 首个 release 会遍历全部历史，限长以免正文过大。
+              git log --no-merges --pretty='- %s (%h)' --max-count=50 "$END"
+            } > CHANGELOG.md
+          else
+            {
+              printf '**Full changelog**: %s/compare/%s...%s\n\n' "$REPO_URL" "$PREV" "$TAG"
+              printf '## Changes since %s\n\n' "$PREV"
+              git log --no-merges --pretty='- %s (%h)' "${PREV}..${END}"
             } > CHANGELOG.md
           fi
           cat CHANGELOG.md
@@ -109,8 +153,8 @@ jobs:
           set -euo pipefail
           echo '${{ secrets.GITHUB_TOKEN }}' | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
 
-      # 三个 tag 共用**同一次** build ⇒ digest 必然相同（核验时三者的
-      # docker-content-digest 必须一致，不一致说明构建了两次）。
+      # 三个 tag 共用**同一次** build ⇒ 同一次发布内三者 digest 必然一致
+      # （跨次构建会不同：COPY 层带检出文件的 mtime，属正常）。
       - name: Build and push image
         run: |
           set -euo pipefail
@@ -126,6 +170,23 @@ jobs:
           docker push "$IMAGE:$VERSION"
           docker push "$IMAGE:latest"
           docker push "$IMAGE:sha-$SHA"
+
+      # 镜像先推、tag 后打：构建失败时不会留下「有 tag、没有镜像」的半成品发布。
+      # 只有自动模式在这里打 tag —— 人工/补发路径的 tag 本来就存在（正是触发它的那个）。
+      - name: Tag and push
+        if: ${{ steps.ver.outputs.mode == 'auto' }}
+        run: |
+          set -euo pipefail
+          TAG='${{ steps.ver.outputs.tag }}'
+          # runner 上没有 git 身份，annotated tag 需要它。
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+            echo "::error::tag $TAG already exists -- concurrent run, or someone tagged it meanwhile"
+            exit 1
+          fi
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
 
       - name: Create GitHub Release
         env:
@@ -147,7 +208,7 @@ jobs:
       - name: Summary
         run: |
           {
-            echo "### 已发布 ${{ steps.ver.outputs.tag }}"
+            echo "### 已发布 ${{ steps.ver.outputs.tag }}（mode=${{ steps.ver.outputs.mode }}）"
             echo ""
             echo "- \`${{ steps.ver.outputs.image }}:${{ steps.ver.outputs.version }}\`"
             echo "- \`${{ steps.ver.outputs.image }}:latest\`"
