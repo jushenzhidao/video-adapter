@@ -1,0 +1,47 @@
+# 零计费 E2E 的**审计偏离层**：`-f docker-compose.yml -f docker-compose.audit.yml`
+#
+# 纪律与 `reports/` 里那次部署验证一致：**base compose 保持最小可部署形态**，
+# 一切"为了验证而加的偏离"收敛在这个文件里，逐条写理由 —— 这样 base 里的每一行
+# 都仍然是为生产服务的，不会因为一次验证而被永久污染。
+#
+# 用途只有一个：让**宿主侧**驱动脚本 `scripts/e2e_zero_cost.py` 能读到假上游的
+# `/__control/*`（"上游实际收到了几次请求、收到了什么"）。
+# 那是"限流降频生效了吗""错误前置真的没发上游吗"唯一有判别力的观测点 ——
+# 不能信被测服务自己的计数。
+#
+#   用法：
+#     docker compose -f docker-compose.yml -f docker-compose.audit.yml --profile mock up -d
+#     python3 scripts/e2e_zero_cost.py
+#
+# 🔴 **不要在生产部署里带这个文件。**
+
+services:
+  adapter:
+    environment:
+      # 偏离 1：假上游是**内网地址**（`http://mock-upstream:9000`），而 `X-Upstream-Url`
+      #         是调用方可控的出站目标，默认必须过 SSRF 校验（内网一律拒绝）。
+      #         只在这一层打开它 —— base compose 与 .env.example 都保持 false。
+      UPSTREAM_ALLOW_PRIVATE_NETWORK: "1"
+
+      # 偏离 2：把两个**必填**密钥显式抬到容器里。
+      #         `${VAR}` 的取值顺序是「shell 环境 → 项目 .env」，所以：
+      #           · 本地跑审计 ⇒ `export ADAPTER_KEY=… TASK_KEY_FINGERPRINT_SECRET=…` 传进去，
+      #             **密钥不落任何仓库文件**；
+      #           · 不导出时则沿用 .env 里的值（行为与不加这几行一致）。
+      #         为什么要抬：.env 里这两个键常留空（模板如此），而空 ADAPTER_KEY
+      #         会让**所有请求 401**、空指纹密钥会退化 sha256 —— 那么"凭证指纹"这条
+      #         断言测的就不是生产形态。
+      ADAPTER_KEY: "${ADAPTER_KEY:-}"
+      TASK_KEY_FINGERPRINT_SECRET: "${TASK_KEY_FINGERPRINT_SECRET:-}"
+      # 偏离 3：**测试流量不进生产 Logfire 项目**。本驱动会发几十条合成任务，
+      #         它们的 span 没有排障价值，却会稀释真实业务的 trace。
+      #         线上通路由 `scripts/logfire_online_probe.py` 单独验（真外发一条）。
+      LOGFIRE_TOKEN: ""
+
+  mock-upstream:
+    ports:
+      # 偏离 2：base 刻意**不发布任何端口**（假上游只有适配器需要访问）。
+      #         但宿主侧驱动要读控制面 ⇒ 加一条**只绑回环**的映射。
+      #         `0.0.0.0:9000:9000` 是错的写法：那会把一个没有任何鉴权的
+      #         控制面（能伪造 429、能读走上游收到的全部请求原文）暴露到网络上。
+      - "127.0.0.1:${MOCK_AUDIT_PORT:-39013}:9000"

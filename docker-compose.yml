@@ -82,6 +82,40 @@ services:
       - redis-data:/data
     # 不发布端口：只给本 compose 网络内的 adapter 用。
 
+  # 假上游（**只在 `--profile mock` 下起**，默认 `up` 不会带上它）。
+  #
+  # 为什么在仓库里而不是测试进程里：原先的 `FakeUpstream` 只活在 `tests/test_engine.py`
+  #   的进程内，**够不到"容器里真跑起来的服务"** ⇒ 制品层 E2E 只能打真实上游（计费）。
+  #   有了它，端到端验证是**零成本**的，可以随便跑。
+  #
+  # 🔴 **不发布任何端口**：它只是适配器的上游，没有理由让外部访问。
+  #   若要宿主侧断言"上游实际收到了几次"（`/__control/*`），用
+  #   `docker-compose.audit.yml` 叠加一层**只绑回环**的映射 —— 那是刻意的审计偏离。
+  mock-upstream:
+    profiles: ["mock"]
+    image: python:3.13-slim
+    command: ["python", "/mock/mock_aivideomaker.py"]
+    environment:
+      MOCK_PORT: "9000"
+      # 产物 URL 的前缀必须**适配器可达**（走 compose 网络用服务名），
+      # 否则 rehost 相位会去抓一个自己够不到的地址。
+      MOCK_PUBLIC_BASE: "http://mock-upstream:9000"
+      PYTHONDONTWRITEBYTECODE: "1"      # 根只读 + 挂载只读，禁写 pycache
+    volumes:
+      # 只读挂载：假上游是**测试夹具**，不该在运行期被改写。
+      - ./mock_upstream:/mock:ro
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import sys,urllib.request as u; op=u.build_opener(u.ProxyHandler({})); sys.exit(0 if op.open('http://127.0.0.1:9000/__healthz', timeout=2).status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 3s
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    restart: unless-stopped
+
 volumes:
   adapter-data:
   redis-data:

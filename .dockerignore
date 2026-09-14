@@ -21,10 +21,12 @@ venv
 # 非运行期内容
 tests
 scripts
+mock_upstream
 docs
 README.md
 Dockerfile
 docker-compose.yml
+docker-compose.audit.yml
 .dockerignore
 
 # 字节码与缓存

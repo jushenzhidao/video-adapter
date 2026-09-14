@@ -96,12 +96,13 @@ DELETE /api/v3/contents/generations/tasks/{id}   → 取消（仅 queued 可取�
 # 依赖（隔离环境，别污染系统 Python）
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
-# 四套测试：全部零消耗（零网络、零真实生成请求）
+# 六套测试：全部零消耗（零网络、零真实生成请求）
 python tests/test_aivideomaker_video_v1.py    # 68 项 翻译层
 python tests/test_engine.py                   # 32 项 引擎端到端（本地假上游）
 python tests/test_rate_limit.py               # 18 项 限流与降频（12 项进程内 + 6 项需 redis）
 python tests/test_persistence_redis.py        #  2 项 重启后仍能 GET（跨实例可见）+ 连不上 redis 启动失败
 python tests/test_observability.py            # 17 项 上报内容（离线；logfire 不在场会红）
+python tests/test_mock_upstream.py            # 57 项 假上游的契约一致性（见下）
 
 # 文档门禁：把 README「接入示例」那一节当断言跑（零成本、只打本地假上游）
 # 发版工作流也会跑它 —— 文档会腐烂，但没人会因为文档过期收到告警。
@@ -118,7 +119,24 @@ cp .env.example .env    # 至少填 ADAPTER_KEY 与 TASK_KEY_FINGERPRINT_SECRET
 # 起服务（容器，推荐：带持久卷与健康检查）
 docker compose up -d --build
 curl -s localhost:8000/healthz      # 里面能看到 version / logfire / queue 三块状态
+
+# 制品层端到端（**零计费**）：打一个真跑起来的容器栈，上游是同网络的假上游
+export ADAPTER_KEY=ak_dev_local TASK_KEY_FINGERPRINT_SECRET=$(openssl rand -hex 32)
+docker compose -f docker-compose.yml -f docker-compose.audit.yml --profile mock up -d --build
+E2E_ADAPTER_KEY=$ADAPTER_KEY E2E_BASE=http://127.0.0.1:8000 \
+  python scripts/e2e_zero_cost.py     # 89 项：含"上游实际收到几次请求"的断言
+docker compose -f docker-compose.yml -f docker-compose.audit.yml --profile mock down -v
 ```
+
+**为什么要两套端到端**：`tests/test_engine.py` 在**同一进程内**用 `ASGITransport` 打自己的
+app —— 它验证引擎语义，但**永远发现不了**"镜像少拷了一个目录""compose 少传了一个环境变量"
+这类问题。`scripts/e2e_zero_cost.py` 打的是**制品**，两者不可互替。
+
+**假上游为什么要单测**：`mock_upstream/` 的失败模式不是"跑不起来"，而是**太宽松** ——
+被测服务出错了它照样点头，于是端到端全绿而缺陷活着。所以它刻意复现了三条会「假绿」的上游
+语义（模型白名单、任务按 Key 归属、取消只认 `PUT`），并由 `tests/test_mock_upstream.py`
+把这套语义钉住。详见 [`mock_upstream/README.md`](mock_upstream/README.md)。
+
 
 **发版**（两条入口，工作流都会跑测试 → 推镜像 → 建 Release）：
 
