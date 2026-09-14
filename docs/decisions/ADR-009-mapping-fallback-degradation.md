@@ -70,7 +70,10 @@ L1 路由映射 / L2 参数回退 / L3 模型降级是三个独立授权面。
 `capability_dropped`）；带 `requested`/`effective`/`reason`/`credits_delta`（**拿不到就 null，不编数字**）；
 `model_downgrade` 额外带 **`vendor_changed`**（`t2v` 实测是 minimax_h3 ⇒ `true`）——
 这是调用方最需要知道、也最容易漏报的一位。
-🔴 **`dry_run` 必须完整产出该块**，否则它只是"语法检查"。
+
+⚠️ **`dry_run` 不额外携带该块**（2026-09-14 用户决定）：dry-run 仍只回
+`requested` / `effective` / `warnings[]` / `unsupported[]`。
+⇒ 代价：在花钱之前只能读字符串判断"会不会被改"；`degradations[]` 只出现在**已提交**的任务响应里。
 
 ### D8. 已有决定不改
 尾帧在单图上游上**可丢**（playbook §3.1 的原决定保留），但必须**结构化**上报为
