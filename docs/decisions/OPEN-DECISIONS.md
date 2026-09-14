@@ -6,7 +6,7 @@
 >
 > 三类 slug：`waiting-on-external-condition` / `design-decision-to-evaluate` / `existing-design-boundary`
 
-**汇总：5 已决 · 10 未决**（2026-09-14 新增 3 项：映射/回退/降级的三个落位问题，见 `ADR-009`）
+**汇总：5 已决 · 11 未决**（2026-09-14：新增 3 项映射/回退/降级的落位问题 + 1 项响应体是否暴露预估成本，见 `ADR-009` / `ADR-010`）
 
 | Date | Source | Open Item | Related Constraints | Current Leaning | Blocked By | Resolves When | Status |
 |------|--------|-----------|---------------------|-----------------|------------|---------------|--------|
@@ -16,7 +16,7 @@
 | 2026-09-13 | §2.5 | **DELETE 的响应形状** | 上游文档未规定；Seedance 契约只规定语义（`queued` 取消 / 终态删除） | 现在：`queued` → 返回任务对象（status=cancelled）；终态 → `{"id":…,"deleted":true}` | 官方文档未见 DELETE 响应示例 | 找到官方响应示例，或确认自定义形状可接受 | OPEN · `design-decision-to-evaluate` |
 | 2026-09-13 | §10.1 | **"任务不存在"用哪个错误码** | 官方码表没有专门的 task-not-found | 复用 `InvalidEndpoint.NotFound`（404）—— 与"未知 provider"同码，**不泄露"它存在但不属于你"** | 官方码表无对应项 | 找到官方码表里的对应项 | OPEN · `existing-design-boundary` |
 | 2026-09-13 | §10.2 | **本地并发满用哪个错误码** | 官方码表里 429 的几个 code 都指上游侧瓶颈 | 暂用 `ServerOverloaded`（429），message 明说"本地闸门满" | 官方码表无"调用方并发超限"这一类 | 找到更贴切的官方 code | OPEN · `design-decision-to-evaluate` |
-| 2026-09-13 | §8.2 | **`usage` 口径：积分 → token 的倍率** | 上游按积分、Seedance 按 token；控制面计费依赖这个口径 | 默认 1:1 折算（`credits_per_token` 可覆盖），**同时保留原始积分字段**不丢信息 | 控制面的计费口径确认 | 控制面确认按哪种口径消费 | OPEN · `waiting-on-external-condition` |
+| 2026-09-13（**2026-09-14 收窄**） | §8.2 | **`usage` 口径：积分 → token 的倍率** | 上游按积分、Seedance 按 token；**消费方已确认为 new-api**（本服务作为其上游渠道，见 `ADR-010`） | 默认 1:1 折算（`credits_per_token` 可覆盖），**同时保留原始积分字段**不丢信息；⚠️ 该倍率实质是**运营方的定价旋钮** —— 改它等于改单价 | 需确定 new-api 渠道的**具体计价取值**：按 token 当量还是按次、倍率取多少 | 定下 new-api 渠道的计价配置，并跑一次"预估 vs 实收"对账 | OPEN · `waiting-on-external-condition` |
 | 2026-09-13 | §9.2 | **dry-run 开关形态** | 架构 D1 说"配置全走请求头"，而 dry-run 是调试开关不是渠道配置 | 已实现三个入口：`X-Dry-Run: 1` / 体键 `dry_run` / `extra_body.dry_run` | 用户确认是否保留三入口 | 用户确认 | OPEN · `design-decision-to-evaluate` |
 | 2026-09-13 | §6.5 | **协调器是否启用** | 它没有调用方请求可借钥匙 ⇒ 无法自己回查上游；只能做本地可判定的事（超时置 `expired`） | 默认关闭；回调推送改为"调用方查询观察到状态变更时机会式推送"（已实现） | 需要"渠道在运行期注册凭证"的机制 | 决定是否投入做凭证注册 | OPEN · `design-decision-to-evaluate` |
 | 2026-09-13 | §8.2 | **是否需要素材转存（`media.py`）** | aivideomaker 产物是**公开 24h URL**，与 Seedance 原生语义一致 | 倾向不实现（透传即可）；仅当接入"产物需鉴权/有效期 <24h"的上游时再补 | 第二个上游的实际产物语义 | 接入需要转存的上游时 | **RESOLVED**（2026-09-13：落成**逐渠道开关** `X-Channel-Options.rehost`，**默认关**）。Resolution：默认仍是"透传"（与"公开 24h URL"这一事实一致），需要时按渠道开启即可，不必等第二个上游 —— 条件变成**配置**而不是代码。开了之后：`GET /files/{name}` 给自有地址、对象名 `sha256(URL)[:24]` 使重复转存幂等、**转存失败只降级**（任务结果不变，`warnings` 里如实说明）、`rehost.upstream_url` 保留原地址。见 `adapter/media.py` 与 `tests/test_engine.py` 的转存用例 |
@@ -25,3 +25,4 @@
 | 2026-09-14 | `ADR-009` D2 | **`fallback_direction` 的默认值** | 参数回退方向决定"会不会悄悄涨价"；用户举的例子是 `6s=>5s`（向下） | **`down`**（永不涨价）：宁可短，也不在账单上给惊喜 | 产品侧确认"至少 N 秒"这类预期 | 确认默认 `down` 可接受，或需要"按字段分别设默认" | OPEN · `design-decision-to-evaluate` |
 | 2026-09-14 | `ADR-009` D7 | **`degradations[]` 是否进正式响应体** | 现有上报只有人类可读的 `warnings[]`（字符串），机器无法消费；结构化块是纯加法但对既有调用方改变了响应 schema | 新增 `degradations[]`，`warnings[]` 保留为它的自然语言渲染（同一事实两种表示） | 控制面是否做严格 schema 校验 | 确认控制面能容忍新增字段（或确认由控制面消费该块） | OPEN · `design-decision-to-evaluate` |
 | 2026-09-14 | `ADR-009` D6 | **`model_map` / `fallback_chain` 放请求头还是部署级配置** | D1 说"配置全走请求头"，但这两个结构（尤其降级链）比现有头都长 | 倾向仍放 `X-Channel-Options`（零状态、与 D1 一致），但需实测头长 | 实测请求头长度上限 / 控制面能否持久化渠道配置 | 实测结论出来，或决定引入"渠道配置持久化" | OPEN · `design-decision-to-evaluate` |
+| 2026-09-14 | `ADR-010` D5 | **响应体是否暴露 `estimated_credits` 与 `degradations[]`**（含 dry-run） | 计费在 new-api ⇒ "预估 vs 实收"是运营方**配定价与对账的必要输入**；但现状 `estimated_credits` 被脚本算出后**被引擎丢弃，连 dry-run 都不返回**（只回 `requested`/`effective`/`warnings`/`unsupported`） | **暴露**：前者用于渠道定价，两者之差是定价配错的唯一早期信号 | 响应体是对外契约，按纪律 #6 **须先改 `docs/seedance-api-reference.md`**；且要确认 new-api 侧能消费 | 用户确认是否加这两个字段（纯加法） | OPEN · `design-decision-to-evaluate` |
