@@ -17,6 +17,7 @@ venv
 .tasks.sqlite3-shm
 .media/
 *.log
+reports/
 
 # 非运行期内容
 tests
