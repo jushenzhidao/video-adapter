@@ -125,7 +125,13 @@ def store(name: str, data: bytes, settings: Settings) -> Path:
 
 
 def public_url(name: str, base: str) -> str:
-    """对外地址。`base` 来自 `PUBLIC_BASE_URL`，或创建任务时捕获的请求 Host。"""
+    """对外地址。
+
+    `base` 只来自 `PUBLIC_BASE_URL`（`tasks.py` 传 `settings.public_base_url`）。
+    ⚠️ **没有"请求 Host 回退"**：那个回退从没实现过（旧 docstring 在这里说了假话，2026-09-16 订正）。
+    为空时返回**相对路径**（`/files/<name>`），并由调用方所在的查询路径**如实告警**
+    （见 `tasks._apply_fragment` 里那条 `PUBLIC_BASE_URL is unset` 的 warning）。
+    """
     prefix = (base or "").rstrip("/")
     return f"{prefix}/files/{name}" if prefix else f"/files/{name}"
 

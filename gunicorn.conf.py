@@ -30,6 +30,28 @@
 默认 120s，且要 **小于** 编排层的 `stop_grace_period`（compose 里给 150s），
 否则编排层先 SIGKILL，优雅关机就成了摆设。
 
+## 🔴 头部大小：实测结论 + 两个**不要调**的旋钮
+
+2026-09-16 在真 gunicorn 上实测（原始 socket，**不走代理**）：
+
+| 单请求头部合计 | 结果 |
+| --- | --- |
+| 20KB / 70KB / 120KB / **293KB** | ✅ 全部进到应用层（我们的 502 UpstreamUnavailable 就是证据） |
+| 两字段各 70KB（合计 137KB） | ✅ 同上 |
+
+⇒ **头部大小不是本服务的实际问题**：`X-Channel-Options` 的实际用量是"渠道级声明的几条到几十条
+`model_map`"（约 1~3KB），离实测上限差两个数量级。所以：
+
+| 旋钮 | 结论 |
+| --- | --- |
+| `limit_request_field_size`（gunicorn 默认 8190） | **故意不设**。它只作用于 gunicorn **自己的**解析器（同步 worker 走它）；异步 worker 把连接交给 uvicorn，与它无关。设了只会给人"已经按 gunicorn 那套放开了"的错觉 |
+| `worker_connections` | **已删除**。`UvicornWorker` 的源码里**不读它**（`grep worker_connections uvicorn_worker/*.py` 无匹配）。连接数实际由 uvicorn/libuv + 内核 `backlog` 决定；留着它=以为连接有上限 |
+| 抬高 h11 的 `max_incomplete_event_size` | **不做**。当前解析器是 **httptools**（`uvicorn[standard]` 装了它 ⇒ `http="auto"` 走 `HttpToolsProtocol`），h11 的上限根本读不到 ⇒ 改它是个 no-op。⚠️ 2026-09-16 我一度为此加了自定义 worker，**实测发现打在不生效的层，已删除**（真实上限见上表，远够用） |
+
+⚠️ 顺带一条**排障纪律**：给 localhost 做上面这类探测时，`urllib` 会**读系统的 `HTTP_PROXY`**
+（本机实测 `getproxies()` 非空），于是"超大头部"会被**代理**以 431 回掉 —— 那与 gunicorn 无关。
+判据：同一个请求用**原始 socket**（天然不走代理）复测，两次结论不一致就先怀疑客户端那条路。
+
 ## 其余
 
 `max_requests` + jitter 是有意的**滚动重启**：把长生命周期进程里的任何慢泄漏摊平，
@@ -62,17 +84,31 @@ bind = f"0.0.0.0:{_int_env('PORT', 8000)}"
 #: 想开多 worker：先切 `TASK_STORE=redis`，再改这个值。
 workers = _int_env("WEB_CONCURRENCY", 1)
 
+#: ⚠️ 必须写 `uvicorn_worker.UvicornWorker`（不是 `uvicorn.workers.UvicornWorker`：
+#: 后者在 uvicorn 0.52 上弃用、实测会打 DeprecationWarning）。
 worker_class = "uvicorn_worker.UvicornWorker"
 
-#: 每个 worker 同时接受的连接数上限。真正的节流在**闸门**那一层
-#: （`X-Channel-Options.max_concurrency`），这里只是让过载以"排队"而不是"被拒"体现。
-worker_connections = _int_env("WORKER_CONNECTIONS", 1000)
+#: 🔴 `limit_request_field_size` / `limit_request_fields` **故意不设**：它们只作用于 gunicorn
+#: 自己的解析器，对异步 worker 无效（= 安慰剂）；而头部大小实测远不是瓶颈
+#: （293KB 都能进应用）。见模块 docstring 的实测表 —— 别再为此加自定义 worker。
 
-#: 存活看门狗 > 排队(20s) + 上游超时(60s) + 重试余量。
-timeout = _int_env("GUNICORN_TIMEOUT", 300)
+#: 存活看门狗：排队 + **每次尝试**的上游超时 × 重试次数 + 收尾余量。
+#: ⚠️ **由 env 推导**而不是写死 300：`REQUEST_TIMEOUT_SECONDS` 是常被调的旋钮，
+#: 调大它却让 worker 变得可被 SIGKILL，正是"把慢成功变成 502"的经典路径。
+_worst_case_seconds = (
+    _int_env("QUEUE_WAIT_SECONDS", 20)
+    + _int_env("REQUEST_TIMEOUT_SECONDS", 60) * max(1, _int_env("UPSTREAM_RETRY_ATTEMPTS", 3))
+)
+timeout = _int_env("GUNICORN_TIMEOUT", max(300, _worst_case_seconds + 60))
 
-#: 优雅关机窗口：必须 > 在飞的上游调用 + flush_spans()，且 < compose 的 stop_grace_period。
-graceful_timeout = _int_env("GUNICORN_GRACEFUL_TIMEOUT", 120)
+#: 优雅关机窗口：必须 > **一次**在飞的上游调用 + `flush_spans()`(5s)，
+#: 且 **小于** 编排层的 `stop_grace_period`（compose 里给 150s；到期直接 SIGKILL，
+#: 优雅关机就成了摆设）。推导式让"把上游超时调大"自动带出更长的排空窗口。
+#: ⚠️ 调大 `REQUEST_TIMEOUT_SECONDS` 到 120 以上时，要**同时**把 compose 的
+#: `stop_grace_period` 一起调 —— `tests/test_gunicorn_config.py` 会检查这个关系。
+graceful_timeout = _int_env(
+    "GUNICORN_GRACEFUL_TIMEOUT", max(120, _int_env("REQUEST_TIMEOUT_SECONDS", 60) + 30)
+)
 
 #: 高于常见反向代理的 idle 超时（多为 60s），让代理决定长连接何时结束。
 keepalive = _int_env("GUNICORN_KEEPALIVE", 65)

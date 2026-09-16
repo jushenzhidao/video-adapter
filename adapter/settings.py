@@ -64,7 +64,7 @@ class Settings:
     #   ⚠️ 默认存储后端是**本地目录 + 由本服务对外提供**（零依赖、开箱可用）。
     #   S3/MinIO 后端留作扩展点（见 media.py 的 MediaStore 协议）。
     media_dir: str = str(REPO_ROOT / ".media")
-    public_base_url: str = ""                  # 对外地址前缀；空则按请求的 Host 推导
+    public_base_url: str = ""                  # 对外地址前缀；空则给相对路径 /files/<name> 并告警
     rehost_max_bytes: int = 512 * 1024 * 1024
     rehost_timeout_seconds: float = 120.0
 
@@ -132,6 +132,10 @@ class Settings:
     logfire_service_name: str = "video-adapter"
     environment: str = ""
     logfire_console: bool = False              # 本地看 span 用；生产关
+    #: loguru→logfire 桥的最低级别。loguru 不是本服务的依赖（本服务全用 stdlib
+    #: `logging`），它是**宿主应用**的门面 ⇒ 默认 `INFO` 全收：那些行没有别的地方可查。
+    #: 嫌吵（或宿主量大）时调 `WARNING` / `ERROR`。见 observability.py §9。
+    logfire_loguru_level: str = "INFO"
     #: true 直接**拒绝装配**：宽头抓取会把 X-Adapter-Key / Authorization /
     #: X-Auth-Emit 指向的那个头（渠道自选名字）一起抓走，固定名字表不可能覆盖并集。
     logfire_capture_headers: bool = False
@@ -184,6 +188,7 @@ class Settings:
             logfire_service_name=_text("LOGFIRE_SERVICE_NAME", "video-adapter"),
             environment=_text("ENVIRONMENT"),
             logfire_console=_flag("LOGFIRE_CONSOLE", False),
+            logfire_loguru_level=_text("LOGFIRE_LOGURU_LEVEL", "INFO"),
             logfire_capture_headers=_flag("LOGFIRE_CAPTURE_HEADERS", False),
             obs_report_bodies=_flag("OBS_REPORT_BODIES", True),
             obs_body_max_chars=_num("OBS_BODY_MAX_CHARS", 20_000),
