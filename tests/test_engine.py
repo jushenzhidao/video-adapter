@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import http.server
 import json
@@ -24,7 +25,13 @@ import httpx
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from adapter import observability  # noqa: E402
 from adapter.main import create_app  # noqa: E402
+from adapter.seedance import (  # noqa: E402
+    NATIVE_CONTENT_KEYS,
+    NATIVE_TASK_KEYS,
+    NATIVE_USAGE_KEYS,
+)
 from adapter.settings import Settings  # noqa: E402
 
 SCRIPT_STORE = str(ROOT / "script_store")
@@ -250,6 +257,32 @@ def case(fn):
 TASKS = "/api/v3/contents/generations/tasks"
 
 
+@contextlib.contextmanager
+def snapshots():
+    """收集 `task.snapshot` 上报。
+
+    🔴 2026-09-16 起响应体只剩原生字段：上游 task id / 转存结果 / 降级告警 / 实际生效值
+    **只能**从这里取。所以这些证据的断言都改读 span —— 它们仍然被断言着，只是换了出口。
+    如果哪天有人把 `_emit_snapshot()` 从某个出口拆掉，下面这些用例会红。
+    """
+    seen: list[dict] = []
+
+    def sink(record):
+        if record.name == "task.snapshot":
+            seen.append(record.attributes)
+
+    observability.add_span_sink(sink)
+    try:
+        yield seen
+    finally:
+        observability.remove_span_sink(sink)
+
+
+def last_snapshot(snaps: list[dict]) -> dict:
+    assert snaps, "没有任何 task.snapshot 上报（诊断出口被拆掉了？）"
+    return snaps[-1]
+
+
 # =============================================================================
 # 1. 全链路：创建 → 查询 → 终态
 # =============================================================================
@@ -257,47 +290,64 @@ TASKS = "/api/v3/contents/generations/tasks"
 @case
 async def test_create_query_until_terminal(client, app, upstream):
     ch = Client(upstream.base_url)
-    response = await client.post(TASKS, json=_body(), headers=ch.headers)
-    assert response.status_code == 200, response.text
-    created = response.json()
-    assert created["id"].startswith("cgt-")
-    assert "status" not in created, "create must not report a status (Seedance contract)"
-    # 上报块：上游 task id + 脚本身份 + 请求/响应留档（不脱敏）
-    assert created["upstream_task_id"] == "ck001"
-    assert created["provider"] == "aivideomaker"
-    assert created["script_ref"] == "aivideomaker/video@v1"
-    assert created["script_sha256"]
-    assert created["upstream_report"]["request"]["method"] == "POST"
-    assert created["upstream_report"]["request"]["url"].endswith("/api/v1/generate/seedance20")
-    assert created["upstream_report"]["request"]["body"]["prompt"] == "a cat yawning"
-    assert created["upstream_report"]["response"]["status"] == 200
-    assert created["upstream_report"]["response"]["body"]["taskId"] == "ck001"
+    with snapshots() as snaps:
+        response = await client.post(TASKS, json=_body(), headers=ch.headers)
+        assert response.status_code == 200, response.text
+        created = response.json()
+        assert created["id"].startswith("cgt-")
+        # 🔴 **原生契约：创建响应只有 `id`**（`seedance-api-reference.md` §3.3）。
+        # 没有 status，也**没有任何上报块** —— 上游 task id / 脚本身份 / 请求响应留档
+        # 全部走 logfire（见下面的 task.snapshot 断言）。
+        assert set(created) == {"id"}, f"创建响应只应含 id，实得 {sorted(created)}"
 
-    # 上游确实收到了裸 key 头 + 投影后的 body
-    create_call = upstream.requests[0]
-    assert create_call["headers"]["key"] == UPSTREAM_KEY
-    assert "authorization" not in create_call["headers"]
-    assert create_call["path"] == "/api/v1/generate/seedance20"
-    assert create_call["body"] == {
-        "prompt": "a cat yawning", "duration": 5, "resolution": 720, "ratio": "16:9"
-    }
+        # 上游确实收到了裸 key 头 + 投影后的 body
+        create_call = upstream.requests[0]
+        assert create_call["headers"]["key"] == UPSTREAM_KEY
+        assert "authorization" not in create_call["headers"]
+        assert create_call["path"] == "/api/v1/generate/seedance20"
+        assert create_call["body"] == {
+            "prompt": "a cat yawning", "duration": 5, "resolution": 720, "ratio": "16:9"
+        }
 
-    first = await client.get(f"{TASKS}/{created['id']}", headers=ch.headers)
-    assert first.status_code == 200, first.text
-    assert first.json()["status"] == "running"
+        # 从响应体里移走的那些事实，逐项在 logfire 上报里查得到（**一项都不许少**）
+        create_snap = last_snapshot(snaps)
+        assert create_snap["task.id"] == created["id"]
+        assert create_snap["task.upstream_id"] == "ck001"
+        assert create_snap["task.provider"] == "aivideomaker"
+        assert create_snap["task.script.ref"] == "aivideomaker/video@v1"
+        assert create_snap["task.script.sha256"]
+        # 请求/响应留档仍在上报里（「发了什么、上游回了什么」是排障第一问）
+        assert create_snap["task.report.request"]["method"] == "POST"
+        assert create_snap["task.report.request"]["url"].endswith("/api/v1/generate/seedance20")
+        assert create_snap["task.report.request"]["body"]["prompt"] == "a cat yawning"
+        assert create_snap["task.report.response"]["status"] == 200
+        assert create_snap["task.report.response"]["body"]["taskId"] == "ck001"
 
-    second = await client.get(f"{TASKS}/{created['id']}", headers=ch.headers)
-    body = second.json()
+        first = await client.get(f"{TASKS}/{created['id']}", headers=ch.headers)
+        assert first.status_code == 200, first.text
+        assert first.json()["status"] == "running"
+
+        second = await client.get(f"{TASKS}/{created['id']}", headers=ch.headers)
+        body = second.json()
+
     assert body["status"] == "succeeded", body
     assert body["content"]["video_url"].endswith("/media/ck001.mp4")
-    assert body["usage"]["credits"] == 15
     assert isinstance(body["created_at"], int)
-    # 上报块在查询侧同样带着：上游 task id + 查询留档（不脱敏）
-    assert body["upstream_task_id"] == "ck001"
-    assert body["provider"] == "aivideomaker"
-    assert body["upstream_report"]["query_count"] == 2
-    assert body["upstream_report"]["query_response"]["body"]["status"] == "COMPLETED"
-    assert body["upstream_report"]["request"]["url"].endswith("/api/v1/generate/seedance20")
+    # 查询体**逐键等于原生字段集**：不多（诊断块已移除）、不少（原生字段齐全）
+    assert set(body) == set(NATIVE_TASK_KEYS), sorted(set(body) ^ set(NATIVE_TASK_KEYS))
+    assert set(body["content"]) == set(NATIVE_CONTENT_KEYS)
+    assert set(body["usage"]) == set(NATIVE_USAGE_KEYS)
+    assert "model" not in body, "模型名很乱，已从响应体删除"
+    assert body["usage"]["completion_tokens"] == 15      # 15 积分 × 渠道倍率 1
+    # 查询侧的上报：状态推进 + 上游原文 + 这一跳查到了哪里
+    query_snap = last_snapshot(snaps)
+    assert query_snap["task.query.count"] == 2
+    assert query_snap["task.query.served"] == "upstream"
+    assert query_snap["task.upstream_id"] == "ck001"
+    assert query_snap["task.status"] == "succeeded"
+    assert query_snap["task.status.previous"] == "running"
+    assert query_snap["task.status.changed"] is True
+    assert query_snap["task.upstream.raw"]["status"] == "COMPLETED"
 
 
 # =============================================================================
@@ -325,10 +375,12 @@ async def test_rehost_on_stores_the_product_and_serves_our_own_url(client, app, 
     ch = Client(upstream.base_url, options=_rehost_options(rehost=True))
     task_id = (await client.post(TASKS, json=_body(), headers=ch.headers)).json()["id"]
     await client.get(f"{TASKS}/{task_id}", headers=ch.headers)
-    body = (await client.get(f"{TASKS}/{task_id}", headers=ch.headers)).json()
+    with snapshots() as snaps:
+        body = (await client.get(f"{TASKS}/{task_id}", headers=ch.headers)).json()
 
     assert body["status"] == "succeeded", body
-    moved = body["rehost"]
+    # 转存的证据在 logfire（响应体只有原生字段）—— 仍然被断言，只是换了出口
+    moved = last_snapshot(snaps)["task.rehost"]
     assert moved["ok"] is True, moved
     assert moved["bytes"] > 0
     assert moved["content_type"] == "video/mp4"
@@ -338,7 +390,7 @@ async def test_rehost_on_stores_the_product_and_serves_our_own_url(client, app, 
     assert "/files/" in moved["url"]
     # PUBLIC_BASE_URL 没设 ⇒ 相对路径 + 如实告警（不静默）
     assert moved["url"].startswith("/files/")
-    assert any("PUBLIC_BASE_URL" in w for w in body["warnings"])
+    assert any("PUBLIC_BASE_URL" in w for w in last_snapshot(snaps)["task.warnings"])
 
     # 转存后的产物由本服务直接提供，且可重复取
     served = await client.get(moved["url"])
@@ -368,11 +420,14 @@ async def test_rehost_failure_degrades_without_failing_the_task(client, app, ups
     task_id = (await client.post(TASKS, json=_body(), headers=ch.headers)).json()["id"]
     await client.get(f"{TASKS}/{task_id}", headers=ch.headers)
     upstream.tasks["ck001"]["bad_product"] = True          # 让产物地址失效
-    body = (await client.get(f"{TASKS}/{task_id}", headers=ch.headers)).json()
+    with snapshots() as snaps:
+        body = (await client.get(f"{TASKS}/{task_id}", headers=ch.headers)).json()
     assert body["status"] == "succeeded"
-    assert body["rehost"]["ok"] is False
+    snap = last_snapshot(snaps)
+    assert snap["task.rehost"]["ok"] is False
+    # 失败原因与降级告警都如实上报（响应体已不含 warnings）
+    assert any("rehost failed" in w for w in snap["task.warnings"])
     assert body["content"]["video_url"].startswith(upstream.base_url)
-    assert any("rehost failed" in w for w in body["warnings"])
 
 
 @case
