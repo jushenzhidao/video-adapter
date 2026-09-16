@@ -121,8 +121,10 @@ jobs:
         run: pip install -r requirements.txt
 
       # 发版前先验证：镜像推出去就可能被部署，tag 推出去就代表承诺。
-      # 六套 runner **自带**（不依赖 pytest），任一非零退出即失败 → set -e 兜住。
+      # 八套 runner **自带**（不依赖 pytest），任一非零退出即失败 → set -e 兜住。
       # 最后一条把 README 的「接入示例」也当门禁跑：文档会腐烂，但没人会因为文档过期收到告警。
+      # 🔴 这份清单是**显式枚举**：新增/重命名测试文件必须同次改这里，
+      #    否则那套测试**从不执行**，而 CI 照样全绿（见技能 `test-false-green-guard`）。
       - name: Run tests
         env:
           # 空 token ⇒ logfire 只在进程内运行，绝不向云端发 trace（测试本身就是这么写的）
@@ -134,6 +136,7 @@ jobs:
           for t in tests/test_aivideomaker_video_v1.py tests/test_engine.py \
                    tests/test_persistence_redis.py tests/test_observability.py \
                    tests/test_rate_limit.py tests/test_mock_upstream.py \
+                   tests/test_seedance_contract.py tests/test_gunicorn_config.py \
                    scripts/verify_docs_examples.py; do
             echo "===== ${t}"
             python "$t"
