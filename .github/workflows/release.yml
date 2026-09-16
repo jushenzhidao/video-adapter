@@ -133,7 +133,8 @@ jobs:
           RATE_LIMIT_TEST_REDIS_URL: redis://127.0.0.1:6379/15
         run: |
           set -euo pipefail
-          for t in tests/test_aivideomaker_video_v1.py tests/test_engine.py \
+          for t in tests/test_aivideomaker_video_v1.py tests/test_senseaudio_video_v1.py \
+                   tests/test_engine.py \
                    tests/test_persistence_redis.py tests/test_observability.py \
                    tests/test_rate_limit.py tests/test_mock_upstream.py \
                    tests/test_seedance_contract.py tests/test_gunicorn_config.py \

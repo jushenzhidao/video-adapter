@@ -8,6 +8,15 @@
       "digests": {
         "v1": "da59790d4980b7c9ffcd8b061597b6390bcf20ee4a420c958e5917c7d5f5aaa0"
       }
+    },
+    "senseaudio/video": {
+      "latest": "v1",
+      "aliases": {
+        "stable": "v1"
+      },
+      "digests": {
+        "v1": "982b6f4e8214368aa54a81988c48576aa52ebd8418c3e517ff7685226dad3a91"
+      }
     }
   }
 }
