@@ -137,11 +137,13 @@ X-Channel-Options: {"provider":"aivideomaker","max_credits":5000,
 - [x] **可观测（span / Logfire）接线**：每次上游调用带 **request/response 原文 + 上游 task id**，
       凭证在源头打码；字段表见 [`docs/03_引擎架构.md`](docs/03_引擎架构.md) §12，
       决策见 [`ADR-006`](docs/decisions/ADR-006-report-fidelity.md)
-- [x] 九套测试共 **304 项**全绿，零消耗（见下；其中 6+2 项需要真 redis）
+- [x] 九套测试共 **303 项**全绿，零消耗（见下；其中 6+2 项需要真 redis）
 - [x] **第二个上游 `senseaudio`**（2026-09-17）：`script_store/senseaudio/video@v1.py`
       ＋ 上游契约 `docs/upstreams/senseaudio-official-api.md`（含 15 处差异核对与 7 项未证实项）
       ＋ **54 项零消耗测试**（`python tests/test_senseaudio_video_v1.py`，含引擎级"上游实际收到的 body"断言）。
-      关键取舍：`watermark`/`generate_audio` **显式发送**（上游默认值与原生相反/未文档化）、
+      关键取舍：`watermark` **显式发送**（上游默认加、原生不加）＋ `generate_audio` **固定发嵌套**
+      `provider_specific`（上游只认嵌套、扁平是火山独有 ⇒ 发错形态 = 静默没声音，故不留开关；
+      **默认开声音**）、
       `content[]` 三种形状差异逐项改写、**媒体顺序一字不动**（`@图像n` 编号靠它）、
       两模式互斥与仅音频一律 400、`usage` 恒 `null`（上游没有任何用量字段）。
       连带修掉一处引擎缺陷：**上游没有取消端点时 `DELETE` 会伪造 `cancelled`**
@@ -181,9 +183,9 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 # 九套测试：全部零消耗（零网络、零真实生成请求）
 python tests/test_aivideomaker_video_v1.py    # 79 项 翻译层一（透传/精确与通配映射/别名/遗留键拒绝）
-python tests/test_senseaudio_video_v1.py      # 68 项 翻译层二 + 引擎级（body 逐键断言/两模式互斥/
-                                              #        media 顺序不变/watermark 默认值相反/错误相位映射/
-                                              #        记录归属校验/无取消端点的 DELETE）
+python tests/test_senseaudio_video_v1.py      # 67 项 翻译层二 + 引擎级（body 逐键断言/两模式互斥/
+                                              #        media 顺序不变/watermark 与 generate_audio 形态/
+                                              #        错误相位映射/记录归属校验/无取消端点的 DELETE）
 python tests/test_engine.py                   # 35 项 引擎端到端（本地假上游）
 python tests/test_seedance_contract.py        # 15 项 **原生响应契约**（形状/字段集/六态/上报不丢）
 python tests/test_rate_limit.py               # 18 项 限流与降频（12 项进程内 + 6 项需 redis）
@@ -303,7 +305,7 @@ X-Channel-Options: {"provider":"senseaudio","max_credits":5000,"allow_unpriced":
 BODY 的 model:     "senseaudio/doubao-seedance-2-0-260128"   # 上游认的就是这个火山原生 ID
 ```
 
-⚠️ 与 aivideomaker 的五处不同，接入前必须知道（细节见
+⚠️ 与 aivideomaker 的六处不同，接入前必须知道（细节见
 [`docs/upstreams/senseaudio-official-api.md`](docs/upstreams/senseaudio-official-api.md) §7）：
 
 1. **终端点的 `DELETE` 会 400** —— 该上游没有取消端点，跑起来的任务停不下来
@@ -317,9 +319,11 @@ BODY 的 model:     "senseaudio/doubao-seedance-2-0-260128"   # 上游认的就�
    连带要求 **`max_concurrency: 1`**：同一把钥匙上出现第二个在跑任务后，旧任务就再也查不到了；
 5. **上游忙 / 账户欠费不再被读成"你写错了"** —— 该渠道配了错误相位：`400015`（并发已满）
    → 429 `ServerOverloaded`、`400001` → 429 `QuotaExceeded`、`400900~902` → 403
-   `AccountOverdueError`（[`ADR-015`](docs/decisions/ADR-015-error-phase-mapping.md)）。
-   渠道还额外可用 `status_binding` / `generate_audio_field` / `query_id_param` /
-   `retry_after_seconds` 四个键（见 `docs/03_引擎架构.md` §4.2 末尾）。
+   `AccountOverdueError`（[`ADR-015`](docs/decisions/ADR-015-error-phase-mapping.md)）；
+6. **声音默认开，且形态固定为嵌套** —— 同名参数在两侧**位置不同**（火山顶层扁平 / 上游
+   `provider_specific.generate_audio`），发错位置是**静默没声音**⇒ 脚本固定发嵌套、不留开关。
+   渠道还额外可用 `status_binding` / `query_id_param` / `retry_after_seconds` 三个键
+   （见 `docs/03_引擎架构.md` §4.2 末尾）。
 
 > 📌 本节（aivideomaker 那一段）的每条都由 `scripts/verify_docs_examples.py` 断言；
 > `senseaudio` 的等价断言在 `tests/test_senseaudio_video_v1.py` §B（**不在本文档门禁内**）。

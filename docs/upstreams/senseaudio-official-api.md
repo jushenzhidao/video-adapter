@@ -79,7 +79,7 @@ curl -X GET "https://api.senseaudio.cn/v1/video/status" \
 | `ratio` | string | ✅ | — | `16:9` / `4:3` / `1:1` / `3:4` / `9:16`（**无 `21:9`、无 `adaptive`**） |
 | `timeout` | int | ❌ | — | 最大超时秒数，`[3600, 172800]` |
 | `watermark` | bool | ❌ | **`true`** | 是否加水印 —— ⚠️ **默认加**，与 Seedance 原生默认 `false` **相反** |
-| `provider_specific` | object | ❌ | — | 厂商特定参数；文档对本模型只给 `{"generate_audio": true}`，且**不认识的键会被静默忽略**。⚠️ **本层默认改发扁平 `generate_audio`**（用户 2026-09-17："火山是扁平的"）⇒ 默认**不发**这个字段，见 §7 差异 3 与 §9 未证实项 4/8 |
+| `provider_specific` | object | ❌ | — | 厂商特定参数。🔴 **`generate_audio` 必须放在这里**（用户 2026-09-17 实测："上游不接受扁平 generate_audio，只有火山接受扁平"）⇒ 本层固定发 `{"generate_audio": <bool>}`，**默认开声音**。⚠️ 不认识的键会被**静默忽略** —— 这正是"发错位置 = 没声音且无提示"的成因 |
 
 ### 3.2 `content[]` 元素 `[官方]`
 
@@ -252,7 +252,7 @@ pending ──▶ processing ──▶ completed
 | --- | --- | --- | --- | --- |
 | 1 | `content[]` 形状 | `image_url.url` / `video_url.url` / `audio_url.url` 对象内，`type=image_url`，`role=reference_image` | `url` / `video_url` / `audio_url` **平铺**，`type=image`，`role=reference` | 谱照上游改写（出口仍只收原生形状，前门归一化已把 `role` 提到顶层） |
 | 2 | `watermark` 默认 | `false` | **`true`** | 🔴 **必须显式发 `watermark`**：调用方没写时要发 `false`，否则会拿到一个**没人要的水印** |
-| 3 | `generate_audio` | 2.x 默认 `true`；**独立顶层字段（扁平）** | 文档示例放在 `provider_specific` 里，默认未写 | **默认发顶层扁平字段**（2026-09-17 用户确认："generate_audio 火山是扁平的"）；渠道可用 `generate_audio_field=provider_specific` 切回文档形态 |
+| 3 | `generate_audio` 的**位置** | `true`（2.x 默认）；**顶层扁平字段** | **只认 `provider_specific.generate_audio`**（不接受扁平，2026-09-17 实测确认） | 🔴 **固定发嵌套 + 默认开声音**。同一个参数在两侧**位置不同** ⇒ 发错形态 = **静默没声音**（成品没有音轨，而响应体里看不出来）⇒ **不留开关**（曾经的 `generate_audio_field` 已撤除） |
 | 4 | `resolution` | 480p/720p/1080p/**4k**；2.0 默认 720p；可省略 | 480p/720p/1080p；**必填** | 缺省补原生默认 `720p`；`4k` 越界 ⇒ 钳到 `1080p` + warning |
 | 5 | `ratio` | 含 `21:9` 与 `adaptive`；默认 `16:9`；可省略 | 只有 5 种，**无 `adaptive`**；必填 | 缺省补 `16:9`；`21:9` 按最接近宽高比吸附；`adaptive` 无上游语义 ⇒ 落 `16:9` + warning（与 `aivideomaker/video@v1` 同口径） |
 | 6 | `duration` | 4–15 或 `-1`（模型自选） | **4–15 整数，必填，无 `-1`** | `-1` ⇒ 取原生默认 `5`（不是区间下界，理由见 §8）；越界钳制 |
@@ -291,11 +291,11 @@ pending ──▶ processing ──▶ completed
 | ~~1~~ | ~~查询参数 `id` 到底吃 `task_id` 还是记录 `id`~~ | **已定（2026-09-17 用户实测）：该接口根本没有参数** —— 身份来自 API key，见 §2.2 | 默认 `status_binding=credential` + 验明记录归属（`ADR-016`）；文档那个 `?id=` 形态留成开关 |
 | 2 | **错误响应体的 JSON 形状** | 文档只有码表，**没有响应体示例**。脚本按"多认几个位置"处理（`ref_code` / `code` / `error_code` / `error{}`） | 若实际形状不在其中，业务码映射会**静默退化为不拦**（落回 HTTP 状态的通用映射）。⚠️ 观测点：出口码是否仍是 `InvalidParameter` |
 | ~~3~~ | ~~`400015` / `400001` 等非参数类错误的出口语义~~ | **已修（2026-09-17）**：新增错误相位，映射表见 §5.1（`ADR-015`） | 已不再把"上游忙 / 账户欠费"读成"请求写错" |
-| 4 | `provider_specific.generate_audio=false` 是否被接受 | 文档只给了 `true` 的示例，并明确"不支持的字段会被忽略"。**现在默认根本不发嵌套形态**（发扁平，见 §7 差异 3） | 若上游**只认**嵌套形态，扁平会被忽略 ⇒ 拿到无声产物（观测点：产物是否带音轨）。应急开关：`generate_audio_field=provider_specific` |
+| ~~4~~ | ~~`provider_specific.generate_audio=false` 是否被接受~~ | **已定（2026-09-17 用户实测）**：上游只认**嵌套**形态；本层固定发嵌套、**默认 `true`（开声音）** | 显式 `false` 也走同一位置（`{"generate_audio": false}`），不再有"位置选错"的可能 |
 | 5 | 产物 URL 的有效期与是否需鉴权 | 未文档化 | 决定 `rehost` 是否需要默认打开（现仍默认关） |
 | 6 | 查询接口的频率限额 | 未文档化 | 沿用部署默认 30 rpm；若上游实际更严，会表现为 429（本层有全局冷却兜底） |
 | 7 | `is_new` / `progress` 的语义边界 | 字段表只给了字面描述 | 不进对外响应（原生字段集里没有它们），只留在 logfire 明细里 |
-| 8 | 扁平 `generate_audio` 与嵌套 `provider_specific` 哪个是真形态 | 用户口述"火山是扁平的"（与官方示例相反），**未实测** | 见 4：两个方向都表现为"静默"，所以给了渠道开关 + `effective.generate_audio_field` 可查 |
+| ~~8~~ | ~~扁平 `generate_audio` 与嵌套 `provider_specific` 哪个是真形态~~ | **已定（2026-09-17）**：上游认**嵌套**；扁平是**火山（原生）独有**的形态 | 本层据此固定形态，并撤除 `generate_audio_field` 开关 —— 已知正确形态后再留一个能改错的旋钮，只会留出误配空间 |
 | 9 | **同一把钥匙的并发上限**（`400015` 说的那个"最大并发数量"到底是几） | 未文档化。但查询接口只能回答"当前那一个任务" ⇒ **在跑任务 >1 时，其余任务的状态读不到** | 渠道配 `max_concurrency: 1` 可完全规避；不配就可能出现"旧任务查询 400"（本层会明确说出来，不静默） |
 | 10 | 被顶掉的旧任务的**最终归宿** | 未文档化（会不会被上游清理、多久） | 本层对它的查询会 400；本地记录活到 `execution_expires_after`（默认 48h）由看门狗置 `expired` |
 

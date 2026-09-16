@@ -175,10 +175,10 @@ def test_minimal_text_to_video_body():
         "resolution": "720p",
         "ratio": "16:9",
         "watermark": False,                        # 🔴 原生默认 false，必须显式覆盖上游的 true
-        "generate_audio": True,                    # 原生 2.x 默认 true；默认发**扁平**顶层字段
+        "provider_specific": {"generate_audio": True},   # 🔴 上游只认嵌套；默认开声音
     }
     assert "timeout" not in result["body"]         # 没给 execution_expires_after ⇒ 不发
-    assert "provider_specific" not in result["body"]
+    assert "generate_audio" not in result["body"]  # 扁平形态上游不吃，**绝不发**（发了就没声音）
 
 
 def test_content_shape_is_rewritten_to_upstream_form():
@@ -296,26 +296,22 @@ def test_watermark_is_always_sent_explicitly():
     assert plan(body([text("p")], watermark="false"))[0]["body"]["watermark"] is False
 
 
-def test_generate_audio_defaults_to_native_true_and_is_sent_flat():
-    """火山原生是**扁平**字段（2026-09-17 用户确认）⇒ 默认发顶层 `generate_audio`。
+def test_generate_audio_is_default_on_and_always_nested():
+    """🔴 两侧**同一个参数的位置不同**：火山原生扁平、上游只认 `provider_specific`。
 
-    ⚠️ 官方文档的示例是 `provider_specific.generate_audio` ⇒ 留了渠道开关
-    （`generate_audio_field`），实测发现扁平形态被忽略时一行配置即可切过去。
+    用户 2026-09-17 明确："上游不接受扁平 generate_audio，只有火山接受扁平。"
+    ⇒ 固定发嵌套，且**默认开声音**（原生 2.x 的默认值就是 `true`）。
+    发错形态是**静默没声音**（成品没音轨，响应体里看不出来），所以这条要钉死。
     """
-    flat = plan(body([text("p")]))[0]["body"]
-    assert flat["generate_audio"] is True and "provider_specific" not in flat
-    assert plan(body([text("p")], generate_audio=False))[0]["body"]["generate_audio"] is False
+    default = plan(body([text("p")]))[0]["body"]
+    assert default["provider_specific"] == {"generate_audio": True}
+    assert "generate_audio" not in default
 
-    nested, ctx = plan(body([text("p")]), opts(generate_audio_field="provider_specific"))
-    assert nested["body"]["provider_specific"] == {"generate_audio": True}
-    assert "generate_audio" not in nested["body"]
-    # "我配的 vs 实际发的"必须可查（响应体里没有它的位置，ADR-011）
-    assert ctx.plan["effective"]["generate_audio_field"] == "provider_specific"
-
-
-def test_invalid_generate_audio_field_is_a_channel_error():
-    exc = expect_failure(body([text("p")]), opts(generate_audio_field="nested"))
-    assert exc.code == "channel_config_error" and "generate_audio_field" in exc.message
+    # 显式关声音要能一路透到嵌套里（读布尔别把 "false" 读成真）
+    off = plan(body([text("p")], generate_audio=False))[0]["body"]
+    assert off["provider_specific"] == {"generate_audio": False}
+    off_str = plan(body([text("p")], generate_audio="false"))[0]["body"]
+    assert off_str["provider_specific"] == {"generate_audio": False}
 
 
 def test_duration_minus_one_maps_to_native_default():
@@ -985,7 +981,7 @@ async def test_engine_create_asserts_the_body_that_went_out(client, app, upstrea
         "resolution": "720p",
         "ratio": "16:9",
         "watermark": False,
-        "generate_audio": True,
+        "provider_specific": {"generate_audio": True},
     }, sent["body"]
     assert sent["headers"]["authorization"] == f"Bearer {UPSTREAM_KEY}"   # 标准 Bearer 原样转发
 

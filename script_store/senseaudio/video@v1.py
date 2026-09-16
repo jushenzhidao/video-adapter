@@ -11,9 +11,11 @@
            "model_map": {"<调用方写的名字>": "doubao-seedance-2-0-260128"},
            "rehost": true,
            "status_binding": "credential",                      # 默认（见下）；另一形态 task_id
-           "generate_audio_field": "flat",                      # flat（默认）| provider_specific
            "query_id_param": "id",                              # 只在 status_binding=task_id 时用
            "retry_after_seconds": 5}                            # 上游没说等多久时的退避值
+
+🔴 **`generate_audio` 固定发嵌套形态**（`provider_specific.generate_audio`）：上游**只认**嵌套，
+扁平只有火山（原生）吃 —— 见决定 1，**默认开声音**。
 
 🔴 **`max_concurrency` 建议配 1**：上游的查询接口没有参数、**按 API key 回答**（一次只认得
 一个任务），所以同一把钥匙上放多个在跑任务时，旧任务的状态就再也读不到了
@@ -56,11 +58,12 @@ resolution, ratio, watermark, provider_specific, timeout}`，并把上游任务�
    `generate_audio`（2.x 原生默认 `true`）上游藏在 `provider_specific` 里且没写默认。
    省略任何一个 = 把"实际生效值"交给别人的默认值决定，而响应体已不再是降级告知通道
    （`ADR-011`）⇒ 调用方会拿到一个**没人要的水印 / 没人要的音轨**且无从察觉。
-   ⚠️ `generate_audio` 的**位置**由渠道选项 `generate_audio_field` 决定，
-   **默认 `flat`**（顶层扁平字段，与火山原生一致 —— 2026-09-17 用户确认）；
-   官方文档示例给的是 `provider_specific.generate_audio`（上游契约 §9 未证实项 4）。
-   **若上游忽略了扁平形态（产物没声音就是征兆），把它设成 `provider_specific` 即可** ——
-   一行配置，不用发版；实际发的是哪一种记在 `effective.generate_audio_field`。
+   ⚠️ **`generate_audio` 的位置**：火山原生是**扁平**顶层字段，而**上游只认嵌套**
+   （`provider_specific.generate_audio`）—— 用户 2026-09-17 明确："上游不接受扁平
+   generate_audio，只有火山接受扁平。" ⇒ 本脚本**固定发嵌套**，且**默认开声音**
+   （原生 2.x 的默认值就是 `true`）。曾经的 `generate_audio_field` 开关已撤除：
+   形态已经实测确定，再留一个能改成扁平/嵌套的旋钮，只会留出"配错了就没声音"的空间
+   （静默、且响应体里看不出来）。
 
 2. 🔴 **媒体顺序一字不动，绝不重排**
    Seedance 的提示词里有 `@图像1` / `@视频1` 编号，**编号按媒体的出现顺序算**。
@@ -284,9 +287,8 @@ def _option_choice(
 ) -> str:
     """读一个**取值受枚举约束**的渠道选项。非法值 ⇒ `channel_config_error`（运维的错）。
 
-    选枚举而不是"随便填"的理由：这两个选项都会**改变发出去的请求形状**
-    （`generate_audio` 放哪一层、查询参数叫什么）。静默接受一个拼错的值，
-    就等于让请求悄悄退回默认形态 —— 而"我明明配了"这种认知偏差最难查。
+    选枚举而不是"随便填"的理由：这个选项会**改变发出去的请求形状**（查询带不带参数、参数叫什么）。
+    静默接受一个拼错的值，就等于让请求悄悄退回默认形态 —— 而"我明明配了"这种认知偏差最难查。
     """
     raw = (options or {}).get(key)
     if raw in (None, ""):
@@ -797,14 +799,10 @@ def build_upstream_body(
         #    省略它 = 调用方会拿到一个没人要的水印，而响应体已不再是降级告知通道。
         "watermark": bool(plan["watermark"]),
     }
-    # 🔴 `generate_audio` 的**位置**由渠道选项决定（决定 1 的 ⚠️）：默认扁平（与火山原生一致），
-    #    官方文档示例是 `provider_specific`；实际发哪一种记在 `effective.generate_audio_field`，
-    #    这样"我配的 vs 实际发的"永远可查（响应体里没有它的位置，`ADR-011`）。
-    audio = bool(plan["generate_audio"])
-    if plan["generate_audio_field"] == "provider_specific":
-        body["provider_specific"] = {"generate_audio": audio}
-    else:
-        body["generate_audio"] = audio
+    # 🔴 `generate_audio` **固定发嵌套形态**（决定 1）：上游只认 `provider_specific.generate_audio`，
+    #    扁平只有火山原生吃。发错形态 = **静默没声音**（成品没音轨，而响应体里看不出来），
+    #    所以这里不留开关、也不给"两种都发"的余地。
+    body["provider_specific"] = {"generate_audio": bool(plan["generate_audio"])}
     if plan.get("timeout"):
         body["timeout"] = plan["timeout"]
     return body
@@ -937,10 +935,6 @@ def plan_create(body: Mapping[str, Any], options: Mapping[str, Any] | None, ctx)
         "generate_audio": _as_bool(
             body.get("generate_audio"), bool(spec["generate_audio_default"])
         ),
-        # `flat`（默认，与火山原生一致）| `provider_specific`（官方文档示例的形态）
-        "generate_audio_field": _option_choice(
-            ctx, options, "generate_audio_field", ("flat", "provider_specific"), "flat"
-        ),
         "timeout": resolve_timeout(body.get("execution_expires_after"), warnings),
         "return_last_frame_requested": _as_bool(body.get("return_last_frame"), False),
     }
@@ -1008,7 +1002,6 @@ def plan_create(body: Mapping[str, Any], options: Mapping[str, Any] | None, ctx)
             "duration": plan["duration"],
             "watermark": plan["watermark"],
             "generate_audio": plan["generate_audio"],
-            "generate_audio_field": plan["generate_audio_field"],
             "timeout": plan["timeout"],
             "billed": True,
             "billing_note": (
