@@ -8,8 +8,8 @@
     key:               <AIVIDEOMAKER_API_KEY>             # ⚠️ 裸 key 头，无 Bearer
     X-Auth-Emit:       header:key:
     X-Channel-Options: {"max_credits": 300}               # 必填，见"支出上限"
-    可选：{"model": "seedance20", "webhook_url": "https://.../internal/hook",
-           "credits_per_token": 1}
+    可选：{"webhook_url": "https://.../internal/hook", "credits_per_token": 1,
+           "model_map": {"doubao-seedance-2-0-260128": "seedance20"}}
 
 上游契约见 `docs/upstreams/aivideomaker-official-api.md`（本文件的唯一依据）。
 
@@ -35,9 +35,13 @@
 四个决定，都是"会真花钱"或"会静默出错"的那一类
 =============================================================================
 
-1. 未知模型名 **400，绝不落默认值**
-   旧实现 `pick_official_model()` 的兜底是 `return "seedance20"`。那是这条链上最危险的默认：
-   写错一个字母 → 落到 seedance20 → **提交即计费**。现在未知名字直接 400，并列出 8 个合法值。
+1. 模型名**透传**：本层不改值，只在渠道显式配了映射表时才映射
+   调用方写什么名字，就发到 `POST /api/v1/generate/{那个名字}`。合法值就是上游那 8 个槽位
+   （`OFFICIAL_MODELS`）；**其余一律 400**，并列出合法值与渠道已配的映射键 ——
+   绝不落默认值（旧实现的兜底是 `return "seedance20"`：写错一个字母就落到一个
+   **提交即计费**的槽位）。需要"调用方写原生 ID、上游认槽位名"时由渠道给映射表，见下节。
+   ⇒ 名字转换**只有** `model_map` 一处配置：渠道级的"钉住槽位"（`X-Channel-Options.model`）
+   2026-09-16 已撤除，原因见下节。
 
 2. 参考类素材**不能静默丢**
    判定准则：丢掉它会不会改变"用户想要什么"？
@@ -56,12 +60,50 @@
 
 4. 调用方的错与运维的错分开报
    调用方传错 `model` / `ratio` → 400 `InvalidParameter`；
-   渠道头配错（`X-Channel-Options.model` 非法、缺 `max_credits`、缺 `X-Upstream-Url`）
-   → `channel_config_error`。报错层次错了，排查就会去错的地方。
+   渠道头配错（`model_map` 值非法 / 重复键、遗留已撤除的 `X-Channel-Options.model`、
+   缺 `max_credits`、缺 `X-Upstream-Url`）→ `channel_config_error`。
+   报错层次错了，排查就会去错的地方。
 
 =============================================================================
-按模型分档（旧实现最大的错源）
+模型映射：默认透传，需要时由渠道配置
 =============================================================================
+
+本层**不改模型值**（判据原话："代码里不改模型值"）。所以能用的名字就是上游 8 个槽位名。
+调用方（或它的控制面）写火山原生 ID 时，由**渠道**给映射表：
+
+    X-Channel-Options: {"provider": "aivideomaker",
+                        "model_map": {"doubao-seedance-2-0-260128": "seedance20",
+                                      "doubao-seedance-1-0-pro-250528": "t2v"}}
+
+五条约束，每条都对应一次实测：
+
+1. **精确优先，通配只有一个元字符。** 键里含 `*` 即为通配模式（`doubao-seedance-*`、`*`），
+   `*` 匹配任意字符序列（含空），可出现在名字任意位置；**匹配大小写敏感**，
+   `?` / `[` / `]` 是**字面量**，不是元字符。精确命中永远压过通配。
+   ⚠️ **绝不做顺序敏感的多规则匹配**：两条通配同时命中 ⇒ `channel_config_error`，
+   不排序、不取最长 —— 旧实现的正则表就是这样把 5 个代次压进同一槽位、账单差 7.3 倍的。
+2. **重复键显式拒绝。** JSON 里同名键会静默覆盖，而"哪一条生效"决定了账单，
+   所以重复键（大小写不同也算）一律 `channel_config_error`，不取后者。
+3. **不猜缺省。** 没配表、名字又不认识 ⇒ 400，并同时列出合法槽位与渠道已配的映射键。
+   "兜底到某个槽位"是最坏的选项：错名字应当**响亮**，不该变成一张账单。
+4. **命中必须可查。** 命中写进 `effective.model_map_applied`（引擎再上报 logfire）。
+   响应体里已没有 `model` 字段 ⇒ "我请求的 vs 实际跑的"只能靠这里与 dry-run 核。
+
+5. **通配可以强转，所以命中必须指名。** 通配（含 `*` 单键）**优先于**
+   "名字本身就是槽位名"：`{"*": "t2v"}` 就是渠道级的"本渠道只跑 t2v" ——
+   任何名字（含合法槽位名 `wan27`）都会被改写成 `t2v`。它是**渠道声明**、不是本层兜底，
+   代价是"我以为请求的是 A、实际跑的是 B"，所以命中的**模式**必须可查：
+   写进 `effective.model_map_pattern`（dry-run 与 logfire 都能回答"为什么被改了"）。
+
+⚠️ 映射表**只在渠道声明时生效**，服务端不持任何模型/渠道知识（架构 D1）。
+
+**唯一入口**：`model_map` 之外没有第二个名字转换点。渠道级的"钉住槽位"（`X-Channel-Options.model`）
+2026-09-16 **撤除** —— 它只做一致性断言、不承担翻译，与"一个渠道一套配置"的其余部分重复；
+它换来的"这个渠道只服务某个槽位"这条本地前置拦截，**改由 `model_map` 的通配承接**
+（约束 5 的 `{"*": "t2v"}`）。⚠️ 语义并不等价：通配是**改写模型值**（请求照样放行，
+命中的模式记在 `effective.model_map_pattern`），钉住是**拦下请求**。
+⚠️ 遗留该键 ⇒ `channel_config_error`（**不静默忽略**）：以为它还钉着的运维会以为这个渠道只跑某个槽位，
+而实际上任何合法槽位名都会被逐字发到那个上游端点。
 
 旧实现用**一张全局档位表**套所有模型，并在注释里承认"官方 seedance20 的真实档位未验证"。
 官方文档给了 8 个模型各自的档位，其中三个是**连续区间**而非离散档位：
@@ -206,17 +248,9 @@ MODEL_SPECS: dict[str, dict[str, Any]] = {
     },
 }
 
-#: Seedance 侧模型名 → 上游模型名。**顺序敏感**（先长后短），且**没有兜底**。
-_MODEL_PATTERNS: tuple[tuple[str, str], ...] = (
-    (r"seedance", "seedance20"),
-    (r"hailuo|minimax", "minimax"),
-    (r"happyhorse", "happyhorse"),
-    (r"\bwan", "wan27"),
-    (r"^i2v_?v3", "i2v_v3"),
-    (r"^i2v", "i2v"),
-    (r"^t2v_?v3", "t2v_v3"),
-    (r"^t2v", "t2v"),
-)
+#: ⚠️ 这里**曾经**有一张 `_MODEL_PATTERNS` 正则表（`(r"seedance", "seedance20")` 打头）。
+#: 2026-09-16 删除，原因是它把 5 个不同代次的原生 ID 静默压进同一个槽位、且不回告警，
+#: 实测账单差 7.3 倍。**不要再加回来** —— 映射知识属于控制面（`X-Channel-Options.model_map`）。
 
 
 # =============================================================================
@@ -235,40 +269,169 @@ def _reject(ctx, message: str, param: str):
     raise AssertionError("ctx.fail returned without raising")
 
 
-def match_upstream_model(model: str) -> str:
-    """Seedance 侧 model → 上游模型名。**未知即抛 `LookupError`，绝不兜底。**"""
+def bare_model_name(model: Any) -> str:
+    """剥掉 `provider/` 段，留下调用方写的**裸模型名**。
+
+    引擎（`resolve_provider`）已经剥过一次；这里再剥是防御性的 —— 脚本不假设调用方
+    一定是从那条路径进来的（内联脚本、`/docs` 试调、将来的别的调用点都会走这里）。
+    """
     name = str(model or "").strip()
-    # 引擎可能尚未剥掉 provider 段（`aivideomaker/seedance20`）；这里防御性处理。
     if "/" in name:
-        name = name.rsplit("/", 1)[1]
-    if not name:
-        raise LookupError("model is required")
-    for pattern, upstream in _MODEL_PATTERNS:
-        if re.search(pattern, name, re.I):
-            return upstream
-    raise LookupError(
-        f'unknown model "{name}" — no upstream model matches. '
-        "Refusing to fall back to a default: a wrong name must not silently reach another "
-        "upstream and get billed. "
-        f"Known upstream models: {', '.join(OFFICIAL_MODELS)}"
-    )
+        name = name.rsplit("/", 1)[1].strip()
+    return name
 
 
-def resolve_upstream_model(model: str, options: Mapping[str, Any] | None, ctx) -> str:
-    """确定上游模型名。渠道声明优先，但**渠道声明非法也是错误**（拦住配错的渠道）。"""
-    override = str((options or {}).get("model") or "").strip()
-    if override:
-        if override not in OFFICIAL_MODELS:
+def resolve_model_map(options: Mapping[str, Any] | None, ctx) -> dict[str, str]:
+    """渠道配置的模型映射表，形如 `{"doubao-seedance-2-0-260128": "seedance20"}`。
+
+    键名取 `model_map`。⚠️ **`upstream_model_map` 作为别名同样接受**：
+    `docs/03_引擎架构.md` §4.2 早先登记过这个名字（当时并未实现），运维可能照那份文档配 ——
+    两个都写且内容不同 ⇒ `channel_config_error`（自相矛盾的配置不该由我们挑一个）。
+
+    **配置非法是运维的错** ⇒ `channel_config_error`（与"调用方传错模型"分开报，
+    见模块 docstring 决定 4）。值必须是上游槽位之一：给一个上游不认识的值，
+    等于把 400 推到上游 —— 而那时请求已经带着凭证发出去了。
+
+    键里含 `*` 即为**通配模式**：`*` 是唯一元字符（可出现在任意位置），大小写敏感，
+    `?` / `[` / `]` 按字面量处理。通配与精确键共用同一套校验（值域、重复键、非空）。
+    """
+    raw = (options or {}).get("model_map")
+    alias = (options or {}).get("upstream_model_map")
+    if raw is not None and alias is not None and raw != alias:
+        _fail_config(
+            ctx,
+            "X-Channel-Options.model_map and upstream_model_map are both set and differ; keep "
+            "exactly one (they are two names for the same table)",
+        )
+    raw = raw if raw is not None else alias
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        _fail_config(
+            ctx,
+            "X-Channel-Options.model_map must be a JSON object of "
+            '{"<name the caller sends>": "<upstream slot>"}',
+        )
+    out: dict[str, str] = {}
+    lowered: dict[str, str] = {}
+    for key, value in raw.items():
+        name = str(key or "").strip()
+        slot = str(value or "").strip()
+        if not name or not slot:
+            _fail_config(
+                ctx, f"model_map entries must be non-empty strings (got {key!r}: {value!r})"
+            )
+        if slot not in OFFICIAL_MODELS:
             _fail_config(
                 ctx,
-                f"X-Channel-Options.model={override!r} is not an upstream model "
+                f"model_map[{name!r}]={slot!r} is not an upstream model "
                 f"(expected one of: {', '.join(OFFICIAL_MODELS)})",
             )
-        return override
-    try:
-        return match_upstream_model(model)
-    except LookupError as exc:
-        _reject(ctx, str(exc), "model")
+        # JSON 同名键会**静默覆盖**，而"哪一条生效"直接决定账单 ⇒ 显式拒绝。
+        # 大小写不同也拒绝：`Wan27` 与 `wan27` 是同一个意图，取其一就是猜。
+        fold = name.lower()
+        if fold in lowered:
+            _fail_config(
+                ctx,
+                f"model_map has duplicate entries for {name!r} and {lowered[fold]!r} "
+                "(JSON would silently keep only one of them)",
+            )
+        lowered[fold] = name
+        out[name] = slot
+    return out
+
+
+#: 2026-09-16 撤除的渠道键。它当时的名字是"钉住槽位"（`X-Channel-Options.model`）：
+#: 只做一致性断言（与本次解析结果不一致 ⇒ `channel_config_error`），既不承担任何名字转换，
+#: 也没表达出"这个渠道只服务某个槽位"以外的语义 —— 与 `model_map` 职责重复。
+#: ⚠️ **遗留该键必须响亮失败，不能静默忽略**：以为它还生效的运维会以为这个渠道只跑
+#: 某个槽位，而实际上任何合法槽位名都会被逐字发往那个上游端点。
+_REMOVED_OPTION_KEYS = ("model",)
+
+
+def reject_removed_option_keys(options: Mapping[str, Any] | None, ctx) -> None:
+    """撤除过的渠道键一旦出现 ⇒ `channel_config_error`（配置问题，修复人在运维）。
+
+    静默忽略是更坏的选择：这个键的语义是"本渠道只服务某个槽位"，
+    运维据此认为"调用方传错名字会被拦住"；一旦它不再生效却仍被接受，
+    那层保护就无声消失了。
+    """
+    for key in _REMOVED_OPTION_KEYS:
+        if key in (options or {}):
+            _fail_config(
+                ctx,
+                f"X-Channel-Options.{key} was removed on 2026-09-16: the channel-level "
+                "pinned slot is gone. Use model_map (exact match: the name the caller "
+                "sends -> the upstream slot name), or have callers send the slot name "
+                "verbatim. "
+                f'Remove the "{key}" key from the channel configuration.',
+            )
+def _glob_matches(pattern: str, name: str) -> bool:
+    """`*` 是唯一元字符（匹配任意字符序列，含空）；其余字符按字面量，大小写敏感。
+
+    ⚠️ 不用 `fnmatch`：① 它不在沙箱的 `ALLOWED_IMPORTS` 里（`import fnmatch` 会被
+    `ScriptSecurityError` 拒掉）；② `fnmatch.fnmatch` 会经 `normcase` **折叠大小写**
+    （那是文件系统语义），而模型名匹配必须大小写敏感。
+    """
+    pieces = []
+    for ch in pattern:
+        pieces.append(".*" if ch == "*" else re.escape(ch))
+    return re.fullmatch("".join(pieces), name) is not None
+
+
+def resolve_upstream_model(
+    model: Any, options: Mapping[str, Any] | None, ctx
+) -> tuple[str, bool, str | None]:
+    """裸模型名 → `(上游槽位名, 是否走了渠道映射表, 命中的通配模式或 None)`。
+
+    **本函数不猜、不兜底**（通配不是兜底：它是渠道显式声明的策略，见五条约束）。
+
+    判定顺序：① 精确命中映射表；② **唯一**的通配命中（含 `*` 单键）；
+    ③ 名字本身就是上游槽位名 ⇒ 逐字透传；④ 其余 ⇒ 400。
+    ⚠️ ② 在 ③ **之前** ⇒ `{"*": "t2v"}` 会把合法槽位名也改成 `t2v`（本决定要的语义）。
+
+    ⚠️ 2026-09-16 起**没有**渠道级"钉住槽位"这一步：`X-Channel-Options.model`
+    已撤除，遗留该键由 `reject_removed_option_keys` 拦下（响亮失败，不静默忽略）。
+    """
+    options = options or {}
+    reject_removed_option_keys(options, ctx)
+    name = bare_model_name(model)
+    if not name:
+        _reject(ctx, "model is required", "model")
+
+    mapping = resolve_model_map(options, ctx)
+    pattern: str | None = None
+    if name in mapping:
+        upstream, mapped = mapping[name], True
+    else:
+        hits = [key for key in mapping if "*" in key and _glob_matches(key, name)]
+        if len(hits) > 1:
+            _fail_config(
+                ctx,
+                f"model {name!r} matches {len(hits)} wildcard entries in "
+                f"X-Channel-Options.model_map ({', '.join(sorted(hits))}); refusing to pick "
+                "one, because order-sensitive matching is exactly what this table replaced. "
+                "Keep exactly one pattern that matches.",
+            )
+        if hits:
+            pattern = hits[0]
+            upstream, mapped = mapping[pattern], True
+        elif name in OFFICIAL_MODELS:
+            upstream, mapped = name, False
+        else:
+            hint = (
+                f" The channel's model_map knows: {', '.join(sorted(mapping))}."
+                if mapping
+                else " No model_map is configured on this channel."
+            )
+            _reject(
+                ctx,
+                f'unknown model "{name}". This layer forwards the model name verbatim, so it '
+                f"must be one of the upstream models: {', '.join(OFFICIAL_MODELS)}.{hint}",
+                "model",
+            )
+
+    return upstream, mapped, pattern
 
 
 def _aspect_value(ratio: Any) -> float:
@@ -699,7 +862,9 @@ def plan_create(body: Mapping[str, Any], options: Mapping[str, Any] | None, ctx)
     warnings: list[str] = []
     unsupported: list[str] = []
 
-    upstream_model = resolve_upstream_model(str(body.get("model") or ""), options, ctx)
+    upstream_model, model_map_applied, model_map_pattern = resolve_upstream_model(
+        body.get("model"), options, ctx
+    )
     spec = MODEL_SPECS[upstream_model]
 
     items = body.get("content")
@@ -832,6 +997,13 @@ def plan_create(body: Mapping[str, Any], options: Mapping[str, Any] | None, ctx)
         },
         "effective": {
             "upstream_model": upstream_model,
+            # "我请求的 vs 实际跑的"这一对：响应体里已经没有 `model` 字段了，
+            # 所以判据只剩这里（→ logfire 的 task.effective.*）与 dry-run。
+            "model_requested": str(body.get("model") or ""),
+            "model_map_applied": model_map_applied,
+            # 命中的**模式**（含 "*"）。通配能强转模型值（② 优先于 ③）⇒
+            # "我请求 A、实际跑 B"必须指名道姓，光一个布尔值回答不了"为什么"。
+            "model_map_pattern": model_map_pattern,
             "ratio": plan["ratio"],
             "resolution": plan_resolution,
             "duration": plan["duration"],

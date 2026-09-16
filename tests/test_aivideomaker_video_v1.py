@@ -99,53 +99,198 @@ def expect_failure(fn):
 
 
 # =============================================================================
-# 1. 模型路由：未知名字绝不落默认值
+# 1. 模型路由：**透传**（本层不改模型值），需要时由渠道配映射表
 # =============================================================================
+#
+# 2026-09-16 起本层不再做名字→槽位的映射。旧实现是顺序敏感的正则
+# （`(r"seedance", "seedance20")`），把 5 个不同代次的原生 ID 静默压进同一槽位，
+# 实测账单差 7.3 倍（110 vs 15 积分）。现在的规则有四条：
+#   ① 名字**精确命中**渠道 `model_map` ⇒ 按表替换；
+#   ② 名字命中**唯一**的通配模式（含 `*` 单键）⇒ 按表替换 —— ⚠️ ② 在 ③ **之前**，
+#      所以 `{"*": "t2v"}` 会把合法槽位名也改写掉（这是明确要的语义）；
+#   ③ 名字本身是上游槽位 ⇒ 逐字透传；
+#   ④ 其它 ⇒ 400（列出合法槽位 + 渠道已配的键），**绝不落默认值**。
+# 两条通配同时命中 ⇒ `channel_config_error`：不排序、不取最长。
 
-def test_unknown_model_is_rejected_not_defaulted():
-    ctx = FakeCtx(opts())
-    exc = expect_failure(lambda: avm.plan_create(body("totally-made-up", [text("hi")]), opts(), ctx))
-    assert exc.code == "InvalidParameter", exc.code
-    assert exc.param == "model"
-    assert "seedance20" in exc.message        # 列出了合法值
-    assert "billed" in exc.message            # 讲清了为什么不能兜底
-
-
-def test_model_families_map_to_expected_upstream_models():
-    cases = {
-        "doubao-seedance-2-5-260628": "seedance20",
-        "doubao-seedance-1-5-pro-251215": "seedance20",
-        "MiniMax-Hailuo-02": "minimax",
-        "hailuo-2": "minimax",
-        "wan2.7-t2v": "wan27",
-        "happyhorse-1.1": "happyhorse",
-        "t2v": "t2v",
-        "i2v": "i2v",
-        "t2v_v3": "t2v_v3",
-        "i2v_v3": "i2v_v3",
-    }
-    for name, expected in cases.items():
-        assert avm.match_upstream_model(name) == expected, name
+def test_upstream_slot_names_pass_through_untouched():
+    """8 个槽位名逐字透传 —— 这是"代码里不改模型值"的直接断言。"""
+    for name in avm.OFFICIAL_MODELS:
+        got = avm.resolve_upstream_model(name, {}, FakeCtx(opts()))
+        assert got == (name, False, None), f"{name} → {got}"
 
 
 def test_provider_segment_is_stripped_when_engine_has_not():
-    assert avm.match_upstream_model("aivideomaker/seedance20") == "seedance20"
+    """只有 `provider/` 这一段被剥掉（它是路由信息），模型名本身不动。"""
+    assert avm.resolve_upstream_model("aivideomaker/seedance20", {}, FakeCtx(opts())) == (
+        "seedance20",
+        False,
+        None,
+    )
 
 
-def test_channel_model_override_must_be_a_real_model():
-    ctx = FakeCtx(opts(model="not-a-model"))
-    exc = expect_failure(lambda: avm.plan_create(body("seedance20", [text("hi")]), opts(model="not-a-model"), ctx))
+def test_unknown_model_is_rejected_with_the_legal_list():
+    ctx = FakeCtx(opts())
+    exc = expect_failure(lambda: avm.resolve_upstream_model("totally-made-up", {}, ctx))
+    assert exc.code == "InvalidParameter", exc.code
+    assert exc.param == "model"
+    for name in avm.OFFICIAL_MODELS:            # 合法值一个不落地列出来
+        assert name in exc.message, name
+    assert "verbatim" in exc.message            # 讲清了"本层不改模型值"
+    assert "No model_map is configured" in exc.message
+
+
+def test_model_map_translates_native_ids_and_says_it_hit():
+    """渠道配了映射表 ⇒ 原生 ID 可用，且**命中可查**（响应体里已没有 model）。"""
+    mapping = {
+        "doubao-seedance-2-0-260128": "seedance20",
+        "doubao-seedance-1-0-pro-250528": "t2v",
+    }
+    options = opts(model_map=mapping)
+    plan = avm.plan_create(
+        body("doubao-seedance-2-0-260128", [text("hi")], duration=5, resolution="720p", ratio="16:9"),
+        options,
+        FakeCtx(options),
+    )
+    assert plan["upstream_model"] == "seedance20"
+    assert plan["effective"]["model_map_applied"] is True
+    assert plan["effective"]["model_requested"] == "doubao-seedance-2-0-260128"
+
+
+def test_model_map_is_exact_match_not_a_regex():
+    """`doubao-seedance-2-5-260628` **不会**被 `seedance` 那条规则吞掉（这是 G1 的根因）。"""
+    options = opts(model_map={"doubao-seedance-2-0-260128": "seedance20"})
+    exc = expect_failure(
+        lambda: avm.resolve_upstream_model("doubao-seedance-2-5-260628", options, FakeCtx(options))
+    )
+    assert exc.code == "InvalidParameter", exc.code
+    assert "doubao-seedance-2-0-260128" in exc.message   # 提示渠道已配了哪些键
+
+
+def test_model_map_value_must_be_an_upstream_model():
+    """映射表的值必须是上游认识的槽位：给个上游不认识的值 = 把 400 推到上游。"""
+    options = opts(model_map={"x": "not-upstream"})
+    exc = expect_failure(lambda: avm.resolve_upstream_model("x", options, FakeCtx(options)))
     assert exc.code == "channel_config_error", exc.code
 
 
-def test_channel_model_override_wins():
-    """渠道强制模型时，调用方仍须给出该模型需要的字段（这里是 wan27 的 ratio/resolution）。"""
-    plan = avm.plan_create(
-        body("anything", [text("hi")], duration=5, resolution="720p", ratio="16:9"),
-        opts(model="wan27"),
-        FakeCtx(opts(model="wan27")),
+def test_model_map_accepts_the_documented_alias_name():
+    """`upstream_model_map` 是 `docs/03` §4.2 登记过的旧名 ⇒ 同样接受（别名，不是新机制）。
+
+    `docs/03` 当时登记的 `upstream_model_map` 从未实现过；运维照那份文档配是**很可能**的事，
+    于是这里接受两个名字。两个都写且不同 ⇒ 配置自相矛盾，报错而不是替它挑一个。
+    """
+    options = opts(upstream_model_map={"doubao-seedance-2-0-260128": "seedance20"})
+    assert avm.resolve_upstream_model(
+        "doubao-seedance-2-0-260128", options, FakeCtx(options)
+    ) == ("seedance20", True, None)
+
+    both = opts(
+        model_map={"a": "t2v"},
+        upstream_model_map={"a": "wan27"},
     )
-    assert plan["upstream_model"] == "wan27"
+    exc = expect_failure(lambda: avm.resolve_upstream_model("a", both, FakeCtx(both)))
+    assert exc.code == "channel_config_error", exc.code
+
+    same = opts(model_map={"a": "t2v"}, upstream_model_map={"a": "t2v"})
+    assert avm.resolve_upstream_model("a", same, FakeCtx(same)) == ("t2v", True, None)
+
+
+def test_model_map_rejects_duplicate_keys_json_would_collapse():
+    """JSON 同名键会静默覆盖，而"哪一条生效"决定账单 ⇒ 显式拒绝（大小写不同也拒）。"""
+    options = opts(model_map={"a": "t2v", "A": "wan27"})
+    exc = expect_failure(lambda: avm.resolve_upstream_model("t2v", options, FakeCtx(options)))
+    assert exc.code == "channel_config_error", exc.code
+
+
+def test_removed_channel_model_pin_is_rejected_loudly():
+    """`X-Channel-Options.model`（渠道钉住槽位）2026-09-16 **撤除** ⇒ 遗留该键一律响亮失败。
+
+    ⚠️ **值合法时也照拒**：撤除之后不存在"一致就放行"这条语义了。留一个"恰好一致的钉住"
+    被静默接受，正好会养出"我以为它还钉着"的依赖 —— 而那个依赖已经没有任何代码支撑。
+    修复动作是**删键**，不是让它过。
+    """
+    for value in ("wan27", "t2v", "not-a-model"):
+        options = opts(model=value)
+        exc = expect_failure(
+            lambda: avm.resolve_upstream_model("t2v", options, FakeCtx(options))
+        )
+        assert exc.code == "channel_config_error", f"{value}: {exc.code}"
+        assert "removed" in exc.message, exc.message          # 讲清是"撤除"，不是"拼错"
+        assert "model_map" in exc.message, exc.message        # 指着替代方案
+
+
+def test_wildcard_prefix_maps_a_whole_family():
+    """`doubao-seedance-*` ⇒ 整个家族落到一个槽位，且**命中的模式可查**。"""
+    options = opts(model_map={"doubao-seedance-*": "seedance20"})
+    assert avm.resolve_upstream_model(
+        "doubao-seedance-2-5-260628", options, FakeCtx(options)
+    ) == ("seedance20", True, "doubao-seedance-*")
+
+
+def test_single_star_forces_every_name_including_real_slot_names():
+    """🔴 本决定的**语义核心**：通配优先于"名字本身就是槽位名"。
+
+    `{"*": "t2v"}` = 渠道级的"本渠道只跑 t2v"，**合法槽位名 `wan27` 也会被改写**。
+    这条断言是拿账单换来的：谁把顺序改回"槽位名优先"，它当场变红。
+    """
+    options = opts(model_map={"*": "t2v"})
+    assert avm.resolve_upstream_model("wan27", options, FakeCtx(options)) == ("t2v", True, "*")
+    assert avm.resolve_upstream_model("i2v_v3", options, FakeCtx(options)) == ("t2v", True, "*")
+
+
+def test_exact_key_always_beats_a_wildcard():
+    """精确命中压过通配 —— 否则"给某一个名字开例外"就做不到了。"""
+    options = opts(
+        model_map={"doubao-seedance-*": "t2v", "doubao-seedance-2-0-260128": "seedance20"}
+    )
+    assert avm.resolve_upstream_model(
+        "doubao-seedance-2-0-260128", options, FakeCtx(options)
+    ) == ("seedance20", True, None)
+    assert avm.resolve_upstream_model(
+        "doubao-seedance-2-5-260628", options, FakeCtx(options)
+    ) == ("t2v", True, "doubao-seedance-*")
+
+
+def test_two_matching_wildcards_are_refused_not_ranked():
+    """两条通配同时命中 ⇒ 配置错误。**不排序、不取最长** —— 那是旧正则失败模式的复现。"""
+    options = opts(model_map={"a*": "t2v", "*b": "wan27"})
+    exc = expect_failure(lambda: avm.resolve_upstream_model("ab", options, FakeCtx(options)))
+    assert exc.code == "channel_config_error", exc.code
+    assert "a*" in exc.message and "*b" in exc.message, exc.message   # 两条都点名
+    assert "refusing to pick" in exc.message, exc.message             # 明说不替它选
+
+
+def test_question_mark_and_brackets_are_literals_not_metacharacters():
+    """`*` 是**唯一**元字符：`?` / `[` / `]` 按字面量处理（少一个元字符就少一类误命中）。"""
+    options = opts(model_map={"doubao?": "t2v"})
+    exc = expect_failure(lambda: avm.resolve_upstream_model("doubaoX", options, FakeCtx(options)))
+    assert exc.code == "InvalidParameter", exc.code
+
+
+def test_wildcard_match_is_case_sensitive():
+    """匹配大小写敏感 —— `fnmatch` 的 `normcase` 折叠是文件系统语义，不是模型名语义。"""
+    options = opts(model_map={"doubao-*": "t2v"})
+    exc = expect_failure(
+        lambda: avm.resolve_upstream_model("DOUBAO-seedance-1", options, FakeCtx(options))
+    )
+    assert exc.code == "InvalidParameter", exc.code
+
+
+def test_wildcard_hit_reaches_effective_so_the_rewrite_is_explainable():
+    """🔴 **接线断言**（不是返回值断言）：强转能改模型值 ⇒"为什么被改了"必须能查到。
+
+    响应体里没有 `model`（`ADR-011`）⇒ `effective.model_map_pattern` 是唯一的解释来源之一。
+    只断言 `resolve_upstream_model` 的返回值 **不算** —— 那条路不经过 `effective`。
+    """
+    options = opts(model_map={"*": "t2v"})
+    plan = avm.plan_create(
+        body("wan27", [text("hi")], duration=5, resolution="720p", ratio="16:9"),
+        options,
+        FakeCtx(options),
+    )
+    assert plan["upstream_model"] == "t2v"
+    assert plan["effective"]["model_map_pattern"] == "*", plan["effective"]
+    assert plan["effective"]["model_requested"] == "wan27"
 
 
 def test_wan27_resolution_literal_case_is_produced_by_the_script():

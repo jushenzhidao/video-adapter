@@ -162,6 +162,30 @@ def mock_inject(**kw) -> None:
     mock_ctl("/__control/inject", "POST", kw)
 
 
+#: **原生响应字段集**（`docs/seedance-api-reference.md` §4.1）。
+#: 这里**刻意硬编码**而不是 import `adapter.seedance`：E2E 是独立验收，
+#: 引用被测代码自己的常量等于把断言写成同义反复（实现改了、断言跟着改，永远绿）。
+NATIVE_TASK_KEYS = frozenset(
+    {
+        "id", "status", "content", "error", "usage", "created_at", "updated_at",
+        "seed", "resolution", "ratio", "duration", "frames", "framespersecond",
+        "service_tier", "execution_expires_after", "generate_audio", "draft", "priority",
+    }
+)
+
+
+def newest_upstream_task() -> str:
+    """从**假上游自己**取最近创建的上游 task id。
+
+    响应体里已没有 `upstream_task_id`（原生契约只给原生字段）⇒ 需要它时从上游侧取。
+    这顺带证明一件事：对调用方隐藏上游 id 之后，"和上游对工单"仍然做得到，
+    只是改从上游侧对 —— 那本来也是对账的正确方向。
+    """
+    _, _, j = mock_ctl("/__control/state")
+    ids = sorted((j.get("tasks") or {}).keys()) if isinstance(j, dict) else []
+    return ids[-1] if ids else ""
+
+
 def manifest_digest() -> str:
     """从 `script_store/manifest.json` 取 `aivideomaker/video@v1` 的 sha256。
 
@@ -289,22 +313,20 @@ def main() -> int:
     check(mock_count("POST", "/api/v1/generate") == before, "★ dry-run 上游零请求（非真空对照）")
 
     # ---------------------------------------------------------------- E 创建
-    section("E. 创建（只回 id + 上报块）")
+    section("E. 创建（**只回 id** —— 原生契约）")
     mock_reset()
     st, _, j = call("POST", TASKS, channel(), body_t2v())
     check(st == 200, f"创建 → 200（实得 {st}）")
     cid = j.get("id") if isinstance(j, dict) else None
     check(bool(cid) and str(cid).startswith("cgt-"), f"id 形如 cgt-…（实得 {cid}）")
-    check("status" not in j, "★ 创建响应里**没有** status（Seedance 契约）")
-    check(j.get("provider") == "aivideomaker", f"回显 provider（实得 {j.get('provider')}）")
-    check(j.get("script_ref") == SCRIPT_REF, "回显 script_ref")
-    expected_sha = manifest_digest()
-    check(j.get("script_sha256") == expected_sha,
-          f"script_sha256 与 manifest 一致（实得 {str(j.get('script_sha256'))[:16]}…）")
-    check(bool(j.get("upstream_task_id")), f"上报 upstream_task_id（实得 {j.get('upstream_task_id')}）")
-    ur = (j.get("upstream_report") or {}).get("request") or {}
-    check(ur.get("method") == "POST" and "/api/v1/generate/t2v" in str(ur.get("url")),
-          f"upstream_report 记下真实请求（{ur.get('method')} {ur.get('url')}）")
+    # 🔴 原生契约（`seedance-api-reference.md` §3.3）：创建成功体**只有 `id`**。
+    # 没有 status，也**没有任何上报块** —— 上游 task id / 脚本摘要 / 请求响应留档
+    # 全部改走 logfire（适配层 `task.snapshot` span）。
+    check(set(j) == {"id"} if isinstance(j, dict) else False,
+          f"★ 创建响应**逐键只有 id**（实得 {sorted(j) if isinstance(j, dict) else j}）")
+    note(f"脚本摘要（manifest: {manifest_digest()[:16]}…）不再回显；"
+         "装载期的强校验（SCRIPT_PIN_MANIFEST_DIGESTS）才是它的一致性地基："
+         "摘要不符时**每个请求**都会 400，本脚本根本走不到这里")
 
     _, _, mj = mock_ctl("/__control/requests?method=POST&prefix=/api/v1/generate")
     items = (mj.get("items") or []) if isinstance(mj, dict) else []
@@ -341,6 +363,10 @@ def main() -> int:
           f"返回六态 status（实得 {q1.get('status')}）")
     check("content" in q1 and "video_url" in (q1.get("content") or {}), "契约字段 content.video_url 存在")
     check("usage" in q1, "契约字段 usage 存在")
+    # 逐键等于原生字段集：**不多**（诊断块已移除）、**不少**（原生字段齐全）
+    diff = sorted(set(q1) ^ NATIVE_TASK_KEYS)
+    check(not diff, f"★ 查询体逐键等于原生字段集（差异 {diff}）")
+    check("model" not in q1, "★ 响应体不含 model（上游模型名很乱，已从契约里删除）")
     n_after_first = mock_count("GET", "/api/v1/tasks/")
 
     for _ in range(3):
@@ -425,6 +451,29 @@ def main() -> int:
     note(f"假上游白名单与脚本同集合：{len(KNOWN_MODELS)} 个模型"
          f"（契约一致性由 tests/test_mock_upstream.py 守）")
 
+    # --- 模型映射：**渠道可配置**，默认透传 ---------------------------------
+    # 这个开关的值是控制面塞在 `X-Channel-Options` 头里的 JSON，经 channel 解析后
+    # 才成为脚本的 `ctx.options` ⇒ **只有端到端能验**"开关真的送到了脚本"
+    # （单测里 options 是直接传进去的，实现对了但没人传也永远是绿的）。
+    section("I3. 模型映射（渠道可配置；默认透传，不猜不兜底）")
+    mock_reset()
+    opts_map = json.dumps({
+        "provider": "aivideomaker", "max_credits": 20, "max_concurrency": 4,
+        "model_map": {"doubao-seedance-2-0-260128": "t2v"},
+    })
+    st, _, j = call("POST", TASKS, channel(options=opts_map),
+                    body_t2v(model="doubao-seedance-2-0-260128"))
+    check(st == 200, f"配了 model_map 后原生 ID 可用（实得 {st}）")
+    _, _, mj = mock_ctl("/__control/requests?method=POST&prefix=/api/v1/generate")
+    sent = [it.get("path") for it in (mj.get("items") or [])]
+    check(sent == ["/api/v1/generate/t2v"],
+          f"★ 映射真的落到了上游请求上（实得 {sent}）")
+    # 差分对的另一半：**同一个原生 ID**，在没配映射表的渠道上必须 400。
+    # 这一条防的是"默认偷偷兜底到某个槽位"——那正是 7.3 倍账单的来源。
+    st, _, j = call("POST", TASKS, channel(), body_t2v(model="doubao-seedance-2-0-260128"))
+    check(st == 400, f"未配映射表时同一个原生 ID → 400（实得 {st}）")
+    check("model_map" in json.dumps(j), "错误里点名 model_map 是配置入口")
+
     # ---------------------------------------------------------------- J 转存
     section("J. 素材转存（rehost，逐渠道开关）")
     mock_reset()
@@ -457,7 +506,7 @@ def main() -> int:
     mock_reset()
     st, _, c4 = call("POST", TASKS, channel(options=opts_rehost), body_t2v())
     tid4 = c4.get("id")
-    mock_ctl("/__control/product", "POST", {"task_id": c4.get("upstream_task_id"), "bad": True})
+    mock_ctl("/__control/product", "POST", {"task_id": newest_upstream_task(), "bad": True})
     fin4 = wait_terminal(tid4, options=opts_rehost)
     check(fin4.get("status") == "succeeded", f"★ 产物抓不到时任务仍 succeeded（实得 {fin4.get('status')}）")
 

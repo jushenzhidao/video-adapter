@@ -27,6 +27,9 @@ import httpx  # noqa: E402
 
 from test_engine import FakeUpstream  # noqa: E402
 
+#: 原生六态（README「状态机」一节）。同样刻意重列一份。
+ARK_STATUSES = frozenset({"queued", "running", "succeeded", "failed", "expired", "cancelled"})
+
 ADAPTER_KEY = "ak_demo_adapter_key"
 UPSTREAM_KEY = "ak_upstream_demo_key"
 OPTIONS = (
@@ -34,6 +37,39 @@ OPTIONS = (
     '"max_concurrency":4,"allow_unpriced":true}'
 )
 TASKS = "/api/v3/contents/generations/tasks"
+#: README 里逐字出现的**原生响应字段集**。刻意在这里再列一份（不 import 被测代码）：
+#: 文档示例的验收必须独立于实现，否则实现改了、断言跟着改，文档照样腐烂。
+NATIVE_TASK_KEYS = frozenset(
+    {
+        "id", "status", "content", "error", "usage", "created_at", "updated_at",
+        "seed", "resolution", "ratio", "duration", "frames", "framespersecond",
+        "service_tier", "execution_expires_after", "generate_audio", "draft", "priority",
+    }
+)
+#: 渠道可配置的模型映射表（README「模型名怎么写」一节）。
+MODEL_MAP = {"doubao-seedance-2-0-260128": "seedance20"}
+OPTIONS_WITH_MAP = (
+    '{"provider":"aivideomaker","max_credits":5000,'
+    '"max_concurrency":4,"allow_unpriced":true,'
+    '"model_map":{"doubao-seedance-2-0-260128":"seedance20"}}'
+)
+#: 通配（`*` 是**唯一**元字符）—— 家族映射。
+OPTIONS_WITH_WILDCARD = (
+    '{"provider":"aivideomaker","max_credits":5000,'
+    '"max_concurrency":4,"allow_unpriced":true,'
+    '"model_map":{"doubao-seedance-*":"seedance20"}}'
+)
+#: 单键 `*` = 渠道级"本渠道只跑某个槽位"：**合法槽位名也会被改写**（通配优先于槽位名）。
+OPTIONS_WITH_FORCE = (
+    '{"provider":"aivideomaker","max_credits":5000,'
+    '"max_concurrency":4,"allow_unpriced":true,'
+    '"model_map":{"*":"t2v"}}'
+)
+#: 2026-09-16 **撤除**的渠道键：遗留它必须响亮失败，不能静默忽略（`ADR-012` 修订）。
+OPTIONS_WITH_REMOVED_PIN = (
+    '{"provider":"aivideomaker","max_credits":5000,'
+    '"max_concurrency":4,"allow_unpriced":true,"model":"t2v"}'
+)
 BODY = {
     "model": "aivideomaker/seedance20",
     "content": [{"type": "text", "text": "一只猫在打哈欠"}],
@@ -119,15 +155,14 @@ def main() -> int:
             check("prompt" in (dry.get("upstream", {}).get("body") or {}), "响应里带将发出的 upstream.body")
             check(upstream.count("POST", "/api/v1/generate") == before, "dry-run **没有**发出上游请求")
 
-            print("\n[1] 创建 → 回 id（+ 上报块）")
+            print("\n[1] 创建 → **只回 id**（原生契约）")
             r = client.post(TASKS, json=BODY, headers=headers)
             check(r.status_code == 200, f"创建 → 200（实得 {r.status_code}）")
             created = r.json()
             task_id = created.get("id", "")
             check(task_id.startswith("cgt-"), f"id 形状 cgt-<时间戳>-<随机>（实得 {task_id}）")
-            check("status" not in created, "创建响应**没有** status（契约：只能轮询或走回调）")
-            check(created.get("upstream_task_id") == "ck001", "上报块带上游 task id")
-            check("upstream_report" in created, "上报块带 request/response 留档")
+            # README 明写"创建成功体只有 id"⇒ 逐键断言，多一个键都算文档与实现不一致
+            check(set(created) == {"id"}, f"创建响应逐键只有 id（实得 {sorted(created)}）")
 
             print("\n[2] 查询（同一把 Key）→ 六态；终态带产物地址")
             r1 = client.get(f"{TASKS}/{task_id}", headers=headers)
@@ -141,7 +176,11 @@ def main() -> int:
             done = r2.json()
             check(done["status"] == "succeeded", "二次查询 → succeeded")
             check(bool(done["content"]["video_url"]), "终态 content.video_url 非空")
-            check(done["usage"]["credits"] == 15, "usage 带原始积分（对账用）")
+            check(done["status"] in ARK_STATUSES, f"status 在原生六态里（实得 {done['status']}）")
+            check(done["usage"]["completion_tokens"] == 15, "usage.completion_tokens 按渠道倍率折算")
+            check(set(done) == set(NATIVE_TASK_KEYS),
+                  f"查询体逐键等于 README 的字段表（差异 {sorted(set(done) ^ NATIVE_TASK_KEYS)}）")
+            check("model" not in done, "响应体不含 model（README 已写明删除的理由）")
 
             print("\n[3] 列表")
             r = client.get(f"{TASKS}?page_num=1&page_size=5", headers=headers)
@@ -173,6 +212,64 @@ def main() -> int:
                 r.status_code == 404 and r.json()["error"]["code"] == "InvalidEndpoint.NotFound",
                 "未知任务 → 404 InvalidEndpoint.NotFound",
             )
+            print("\n[6] 模型名：默认透传；原生 ID 需要渠道配 model_map（精确与通配）")
+            # ① 没配映射表 ⇒ 原生 ID 400（不猜、不兜底）
+            r = client.post(TASKS, json={**BODY, "model": "doubao-seedance-2-0-260128"}, headers=headers)
+            check(
+                r.status_code == 400 and r.json()["error"]["param"] == "model",
+                "未配 model_map 时原生 ID → 400（param=model）",
+            )
+            # ② 配了映射表 ⇒ 可用，且上游收到的是映射后的槽位名
+            mapped = {**headers, "X-Channel-Options": OPTIONS_WITH_MAP}
+            before_map = upstream.count("POST", "/api/v1/generate")
+            r = client.post(TASKS, json={**BODY, "model": "doubao-seedance-2-0-260128"}, headers=mapped)
+            check(r.status_code == 200, f"配了 model_map 后原生 ID → 200（实得 {r.status_code}）")
+            calls = [
+                rec for rec in upstream.requests
+                if rec["method"] == "POST" and rec["path"].startswith("/api/v1/generate")
+            ]
+            check(upstream.count("POST", "/api/v1/generate") == before_map + 1, "映射后确实发了 1 次上游创建")
+            check(bool(calls) and calls[-1]["path"] == "/api/v1/generate/seedance20",
+                  f"上游路径是映射后的槽位（实得 {calls[-1]['path'] if calls else None}）")
+
+            # ③ 通配（`*` 是**唯一**元字符）⇒ 家族映射。配置经头 → ctx.options 了吗？
+            wild = {**headers, "X-Channel-Options": OPTIONS_WITH_WILDCARD}
+            before_wild = upstream.count("POST", "/api/v1/generate")
+            r = client.post(TASKS, json={**BODY, "model": "doubao-seedance-2-5-260628"}, headers=wild)
+            check(r.status_code == 200, f"通配家族名可用（实得 {r.status_code}）")
+            check(upstream.count("POST", "/api/v1/generate") == before_wild + 1,
+                  "通配命中确实发了 1 次上游创建")
+            wild_calls = [
+                rec for rec in upstream.requests
+                if rec["method"] == "POST" and rec["path"].startswith("/api/v1/generate")
+            ]
+            check(bool(wild_calls) and wild_calls[-1]["path"] == "/api/v1/generate/seedance20",
+                  f"通配把家族名映射到了槽位（实得 {wild_calls[-1]['path'] if wild_calls else None}）")
+
+            # ④ 单键 `*` = **强转**：合法槽位名 `wan27` 也被改写成 `t2v`（通配优先于槽位名）
+            force = {**headers, "X-Channel-Options": OPTIONS_WITH_FORCE}
+            before_force = upstream.count("POST", "/api/v1/generate")
+            r = client.post(TASKS, json={**BODY, "model": "aivideomaker/wan27"}, headers=force)
+            check(r.status_code == 200, f"单键 * 存在时合法槽位名仍可提交（实得 {r.status_code}）")
+            check(upstream.count("POST", "/api/v1/generate") == before_force + 1,
+                  "强转确实发了 1 次上游创建")
+            force_calls = [
+                rec for rec in upstream.requests
+                if rec["method"] == "POST" and rec["path"].startswith("/api/v1/generate")
+            ]
+            check(bool(force_calls) and force_calls[-1]["path"] == "/api/v1/generate/t2v",
+                  f"🔴 单键 * 把 wan27 改写成了 t2v（实得 {force_calls[-1]['path'] if force_calls else None}）")
+
+            # ⑤ 遗留已撤除的 `model` 键 ⇒ 响亮失败，且**一次上游都不发**
+            stale = {**headers, "X-Channel-Options": OPTIONS_WITH_REMOVED_PIN}
+            before_stale = upstream.count("POST", "/api/v1/generate")
+            r = client.post(TASKS, json=BODY, headers=stale)
+            check(
+                r.status_code == 400 and r.json()["error"]["code"] == "channel_config_error",
+                f"遗留 model 键 → 400 channel_config_error（实得 {r.status_code}）",
+            )
+            check(upstream.count("POST", "/api/v1/generate") == before_stale, "遗留 model 键时**不发上游**")
+
             r = client.get(f"{TASKS}?page_num=1", headers={**headers, "X-Adapter-Key": "wrong"})
             check(
                 r.status_code == 401 and r.json()["error"]["code"] == "AuthenticationError",
