@@ -2,13 +2,19 @@
 
 路由形态与 `model` 的约定见架构 §2：
 
-    POST   /api/v3/contents/generations/tasks        → {"id": "cgt-…"}   （只回 id）
-    GET    /api/v3/contents/generations/tasks/{id}   → 完整任务对象（六态）
+    POST   /api/v3/contents/generations/tasks        → {"id": "cgt-…"}   （**只回 id**）
+    GET    /api/v3/contents/generations/tasks/{id}   → 原生任务对象（六态，**不含 model**）
     GET    /api/v3/contents/generations/tasks        → {"items": […], "total": N}
     DELETE /api/v3/contents/generations/tasks/{id}   → 取消（仅 queued）/ 删除记录
     GET    /healthz
 
 路由**只有火山原生这一族**（不加前缀、不加路径段）；多上游靠 `model = provider/model` 区分。
+
+🔴 **响应体只含原生字段**（形状见 `adapter/seedance.py`）：创建只回 `id`、
+查询不含 `model` 与任何诊断块。上游 task id / 脚本摘要 / 请求响应留档 /
+`requested` / `effective` / 降级告警**只走 logfire**（服务层 `task.snapshot` span）。
+本文件的 span 因此只负责**路由层的三个事实**：谁（provider / request.id）、
+对哪个任务（task.id）、最后什么状态（task.status）。
 """
 
 from __future__ import annotations
@@ -80,14 +86,11 @@ def build_router(settings: Settings) -> APIRouter:
             result = await _service(request).create(
                 channel_config, payload, request_id=_request_id(request), dry_run=dry_run
             )
-            # **上游 task id**：与上游对工单的唯一凭据，必须出现在上报里。
-            # 创建是本服务唯一"刚学到它"的地方，所以在这里补记（请求发出前还不知道）。
-            if result.get("id"):
+            # 响应体只剩 `id`（原生契约）⇒ 路由层能记的也只有它。**上游 task id /
+            # 脚本摘要 / 请求响应留档 / 实际生效值全部由服务层那条 `task.snapshot`
+            # span 承担** —— 只有那里拿得到完整的任务记录。
+            if isinstance(result, dict) and result.get("id"):
                 handle.set_attribute("task.id", result["id"])
-            if result.get("upstream_task_id"):
-                handle.set_attribute("task.upstream_id", result["upstream_task_id"])
-            if result.get("provider"):
-                handle.set_attribute("task.provider", result["provider"])
         return result
 
     @router.get(TASKS_PATH + "/{task_id}", summary="查询视频生成任务")
@@ -118,13 +121,12 @@ def build_router(settings: Settings) -> APIRouter:
             result = await _service(request).get(
                 channel_config, task_id, request_id=_request_id(request)
             )
-            for key, value in (
-                ("task.upstream_id", result.get("upstream_task_id")),
-                ("task.status", result.get("status")),
-                ("task.model", result.get("model")),
-            ):
-                if value:
-                    handle.set_attribute(key, value)
+            # 路由层只记**原生字段**里对排障有用的那两个：状态与产物。
+            # 上游 task id、`requested` / `effective` / 降级告警在 `task.snapshot` 上。
+            handle.set_attribute("task.status", result.get("status"))
+            video_url = (result.get("content") or {}).get("video_url")
+            if video_url:
+                handle.set_attribute("task.artifacts.video_url", video_url)
         return result
 
     @router.get(TASKS_PATH, summary="查询视频生成任务列表")
@@ -144,9 +146,28 @@ def build_router(settings: Settings) -> APIRouter:
         x_script_sha256: str | None = Header(None, alias="X-Script-Sha256"),
         authorization: str | None = Header(None, alias="Authorization"),
     ) -> dict:
-        return await _service(request).list(
-            channel_config, page_num=page_num, page_size=page_size
-        )
+        with observability.span(
+            "task.list",
+            secret=channel_config.credential,
+            **{
+                "task.provider": channel_config.provider or "",
+                "task.list.page_num": page_num,
+                "task.list.page_size": page_size,
+                "request.id": _request_id(request) or observability.current_request_id(),
+            },
+        ) as handle:
+            result = await _service(request).list(
+                channel_config, page_num=page_num, page_size=page_size
+            )
+            handle.set_attribute("task.list.total", result.get("total"))
+            items = result.get("items") or []
+            # 仅**摘要**（id + status）：列表页可能 500 条，逐条上报摘要会撑大 trace，
+            # 而"我看得见谁"这件事由 total 与 id 列表回答就够（详情在各自的查询 span 上）。
+            handle.set_attribute(
+                "task.list.items",
+                [{"id": i.get("id"), "status": i.get("status")} for i in items],
+            )
+        return result
 
     @router.delete(TASKS_PATH + "/{task_id}", summary="取消或删除视频生成任务")
     async def delete_task(
@@ -176,13 +197,8 @@ def build_router(settings: Settings) -> APIRouter:
             result = await _service(request).delete(
                 channel_config, task_id, request_id=_request_id(request)
             )
-            for key, value in (
-                ("task.upstream_id", result.get("upstream_task_id")),
-                ("task.status", result.get("status")),
-                ("task.deleted", result.get("deleted")),
-            ):
-                if value is not None:
-                    handle.set_attribute(key, value)
+            handle.set_attribute("task.status", result.get("status") or "cancelled")
+            handle.set_attribute("task.deleted", bool(result.get("deleted")))
         return result
 
     @router.get("/healthz", summary="存活探针")

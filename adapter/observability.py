@@ -62,6 +62,33 @@ logfire 的批量导出挂在 **daemon 线程**上、不注册 `atexit` ⇒ 退�
 没有 logfire、装配抛错、token 缺失：**服务照常起**，span 仍然构建并落到日志与
 本地 sink（这就是离线校验链路）；只有"真的会外发"这一项为 false，
 且 `/healthz` 把「已配置」与「真的会外发」拆成两个字段如实报告。
+
+## 8. 任务级快照：诊断的唯一出口（2026-09-16 起）
+
+对调用方的响应体已收敛为**种子原生字段**（`adapter/seedance.py`，创建只回 `id`、
+查询不含 `model` 与任何诊断块）。原先"顺带"暴露在响应里的上游 task id、脚本摘要、
+请求/响应留档、`requested` / `effective` / `warnings` / `unsupported` **全部改道这里**：
+每个任务级操作（`task.create` / `task.query` / `task.cancel`）收尾时开一条
+`task.snapshot` span，属性表由 `task_snapshot_attributes()` 产出。
+
+⇒ 纪律从"响应体要如实"变成"**上报要如实且更细**"：响应体可以少，
+logfire 不可以少。改这条链路时先问"这个事实在 logfire 里还查得到吗"。
+
+## 9. 两条日志桥：stdlib `logging` 与自己不用、但宿主在用的 loguru
+
+| 门面 | 谁在用 | 桥接 | 级别 |
+|---|---|---|---|
+| stdlib `logging` | **本服务自己**（`main.py` 配 basicConfig） | `_attach_logging_bridge` | WARNING+ |
+| loguru | **宿主应用 / 被嵌入时**（本仓零引用） | `_attach_loguru_bridge` | 默认 INFO+，`LOGFIRE_LOGURU_LEVEL` 可调 |
+
+两条的**级别默认值刻意不同**：本服务自己的 INFO 行基本都有对应的 span 覆盖
+（"做了什么"由 span 说），所以只把"出事了"那几行发出去就够；而 loguru 是**宿主的
+事件流**，它的 INFO 行没有别的地方可查 —— 漏掉就是永久丢失。嫌吵时用
+`LOGFIRE_LOGURU_LEVEL=WARNING` 调回去。
+
+两条都必须**可解释**：`/healthz.logfire.loguru_bridge` 会给出
+`on:INFO` / `off: loguru is not importable (ModuleNotFoundError)` 这类一行结论 ——
+宿主"我日志怎么没进 logfire"的答案只能在这里。
 """
 
 from __future__ import annotations
@@ -474,6 +501,10 @@ class ObservationState:
     reason: str = ""             # 没装配/不外发的原因 —— 如实说，不静默
     report_bodies: bool = True
     body_max_chars: int = DEFAULT_BODY_MAX_CHARS
+    #: loguru 桥接的状态：`on:INFO` / `off:loguru is not installed` 这类一行说明。
+    #: **不能只有"桥上了/没桥上"**：宿主看到自己的 loguru 日志没进 logfire 时，
+    #: 第一个要问的就是"为什么不进"，而答案只有这里能说清（没装包 / 没装配 / 级别挡了）。
+    loguru_bridge: str = ""
 
     def as_health(self) -> dict[str, Any]:
         return {
@@ -481,6 +512,7 @@ class ObservationState:
             "emitting": self.emitting,
             "ready": self.ready,
             "reason": self.reason,
+            "loguru_bridge": self.loguru_bridge,
         }
 
 
@@ -584,7 +616,13 @@ def setup_observability(settings: Any) -> ObservationState:
             service_name=str(getattr(settings, "logfire_service_name", "video-adapter")),
             environment=str(getattr(settings, "environment", "") or "") or None,
             send_to_logfire="if-token-present",
-            console=bool(getattr(settings, "logfire_console", False)),
+            # 🔴 `console=` 只接受 `ConsoleOptions | None`，**不接受 bool**。
+            # 2026-09-16 实测：`LOGFIRE_CONSOLE=true` 时 `console=True` 让
+            # `logfire.configure` 抛 `AttributeError: 'bool' object has no attribute
+            # 'span_style'` ⇒ 整个可观测**静默降级**（进程照常 healthy，只有
+            # `/healthz.logfire.ready` 能看见）。原先写成 `bool(...)` 是照抄了旧版
+            # 文档里的写法；新版 SDK 换了签名。要开就传一个真的 `ConsoleOptions`。
+            console=(logfire.ConsoleOptions() if getattr(settings, "logfire_console", False) else None),
             # 不把函数参数自动塞进 span：参数里就有凭证。
             inspect_arguments=False,
             scrubbing=scrubbing_options(),
@@ -596,18 +634,20 @@ def setup_observability(settings: Any) -> ObservationState:
         return state
 
     _attach_logging_bridge(logfire)
+    state.loguru_bridge = _attach_loguru_bridge(logfire, level=getattr(settings, "logfire_loguru_level", "INFO"))
 
     state.ready = True
     state.emitting = configured       # send_to_logfire="if-token-present" + token 在场
     state.reason = "" if configured else "no LOGFIRE_TOKEN: spans stay local"
     _STATE = state
     log.info(
-        "可观测已装配 | service=%s emitting=%s token=%s bodies=%s max_chars=%s",
+        "可观测已装配 | service=%s emitting=%s token=%s bodies=%s max_chars=%s loguru=%s",
         getattr(settings, "logfire_service_name", "video-adapter"),
         state.emitting,
         "present" if configured else "absent",
         state.report_bodies,
         state.body_max_chars,
+        state.loguru_bridge,
     )
     return state
 
@@ -626,6 +666,99 @@ def _attach_logging_bridge(logfire: Any) -> None:
         )
     except Exception as exc:  # noqa: BLE001 - 桥接不可用不影响追踪
         log.debug("logging→logfire 桥接不可用：%s", exc)
+
+
+#: loguru 级别名 → OTel 级别名。loguru 比 OTel 多两个：`TRACE`（比 DEBUG 还低）与
+#: `SUCCESS`（loguru 自有的"成功"档，语义上属正常事件 ⇒ 折到 `INFO`）。
+#: **不做字符串透传**：`SUCCESS` / `TRACE` 不是 OTel 的级别名，直接发出去会被
+#: logfire 当成未知级别（静默落进别的桶），而级别是筛选的第一把刀。
+_LOGURU_LEVELS = {
+    "TRACE": "DEBUG",
+    "DEBUG": "DEBUG",
+    "INFO": "INFO",
+    "SUCCESS": "INFO",
+    "WARNING": "WARNING",
+    "ERROR": "ERROR",
+    "CRITICAL": "CRITICAL",
+}
+
+#: loguru sink 的 id（`logger.add` 的返回值）。**全局唯一**：重复挂会把同一行日志
+#: 发多遍，而"发了几遍"在 logfire 上看不出来（它长得就像真的发生了多次）。
+_LOGURU_SINK_ID: int | None = None
+
+
+def _attach_loguru_bridge(logfire_mod: Any, *, level: str = "INFO") -> str:
+    """把 **loguru** 的日志接到 logfire。返回一行状态说明（进 `/healthz`，不静默）。
+
+    **为什么是可选依赖**：本服务自己不用 loguru（全仓 stdlib `logging`）。这个桥接存在，
+    是因为这套引擎是要被**移植/嵌进别的应用**的（同源引擎就活在别的宿主里），
+    而宿主普遍拿 loguru 当日志门面 —— 那些行不接，trace 里就只剩 span、
+    没有"当时那几行话"，而排障恰恰靠它们。
+
+    四条实现纪律：
+
+    1. **不在场就静默跳过**，只返回原因。为一个不存在的包让服务起不来，与
+       "装配失败只降级"（本文档 §7）直接冲突。
+    2. **不夺走宿主自己的 sink**。我们只是**多加一个** sink，宿主原有的 stderr
+       输出照旧 —— 接管别人的日志配置是库最不该做的事。
+    3. **级别按 OTel 级别发**（见 `_LOGURU_LEVELS`），`extra` 逐键变成结构化属性，
+       不做 `json.dumps`（本文档 §3）。
+    4. **sink 内绝不抛**。loguru 的 `catch=True` 会兜住异常，但那是"打印到 stderr"，
+       在容器里等于静默 —— 自己吞掉并降级为一条 debug 日志。
+    """
+    global _LOGURU_SINK_ID
+
+    try:
+        from loguru import logger as loguru_logger
+    except Exception as exc:  # noqa: BLE001 - 没装 loguru 是合法部署
+        return f"off: loguru is not importable ({type(exc).__name__})"
+
+    sink_level = str(level or "INFO").strip().upper() or "INFO"
+    if _LOGURU_SINK_ID is not None:
+        return f"on:{sink_level} (already attached)"
+
+    def _sink(message: Any) -> None:
+        try:
+            record = getattr(message, "record", None)
+            if not isinstance(record, Mapping):
+                return
+            raw_level = str(record.get("level") or {})
+            level_name = getattr(record.get("level"), "name", None) or str(raw_level)
+            attributes: dict[str, Any] = {
+                "loguru.name": record.get("name"),
+                "loguru.level": level_name,
+                "code.filepath": _loguru_file(record),
+                "code.lineno": record.get("line"),
+                "code.function": record.get("function"),
+            }
+            for key, value in (record.get("extra") or {}).items():
+                attributes[f"loguru.extra.{key}"] = value
+            exc = record.get("exception")
+            if exc is not None:
+                # 只留类型与值：traceback 文本里可能带 URL / 凭证片段，而
+                # "哪一行炸的"已经由 `code.filepath` + `code.lineno` 说清了。
+                attributes["exception.type"] = getattr(exc, "type", None)
+                attributes["exception.message"] = str(getattr(exc, "value", "") or "")
+            logfire_mod.log(
+                level=_LOGURU_LEVELS.get(str(level_name).upper(), "INFO"),
+                msg_template=str(record.get("message") or ""),
+                attributes={k: v for k, v in attributes.items() if v not in (None, "")},
+            )
+        except Exception as exc2:  # noqa: BLE001 - 日志桥接绝不反向影响业务
+            log.debug("loguru→logfire sink 失败：%s", exc2)
+
+    try:
+        _LOGURU_SINK_ID = loguru_logger.add(_sink, level=sink_level)
+    except Exception as exc:  # noqa: BLE001
+        return f"off: loguru logger.add failed ({type(exc).__name__}: {exc})"
+    log.info("loguru→logfire 桥接已挂（level=%s）", sink_level)
+    return f"on:{sink_level}"
+
+
+def _loguru_file(record: Mapping[str, Any]) -> str:
+    """loguru 的 `file` 是具名元组（`path` / `name` / `type`），取 `.path`。"""
+    holder = record.get("file")
+    return str(getattr(holder, "path", "") or "")
 
 
 def flush_spans(timeout_millis: int = 5_000) -> bool:
@@ -656,8 +789,17 @@ def observation_state() -> ObservationState:
 
 
 def reset_state() -> None:
-    """测试用：把装配状态复位。"""
-    global _STATE
+    """测试用：把装配状态复位。**连带摘掉 loguru sink** —— 不摘的话下一个用例会
+    在"已经挂了 sink"的世界里跑，而重复挂 sink 会让同一行日志发多遍（看不出差别）。"""
+    global _STATE, _LOGURU_SINK_ID
+    if _LOGURU_SINK_ID is not None:
+        try:
+            from loguru import logger as loguru_logger
+
+            loguru_logger.remove(_LOGURU_SINK_ID)
+        except Exception as exc:  # noqa: BLE001 - loguru 不在场 / 已摘掉
+            log.debug("摘除 loguru sink 失败（无害）：%s", exc)
+        _LOGURU_SINK_ID = None
     _STATE = ObservationState()
     clear_span_sinks()
 
@@ -716,6 +858,162 @@ def upstream_request_attributes(
     if report_bodies and body is not None:
         attributes["upstream.request.body"] = body
     return attributes
+
+
+# ---------------------------------------------------------------------------
+# 任务级快照：**被移出响应体的那些诊断，全部从这里出去**
+# ---------------------------------------------------------------------------
+
+#: 快照里**属于正文**的键（受 `OBS_REPORT_BODIES` 控制，关掉时整键不出现）。
+#: 之所以要这份名单：其余键是"结论"（状态、用量、账目），这几个是"原文"（可能几十 KB）。
+TASK_BODY_ATTRIBUTES = frozenset(
+    {
+        "task.upstream.raw",
+        "task.report.request",
+        "task.report.response",
+    }
+)
+
+
+def task_snapshot_attributes(
+    record: Mapping[str, Any],
+    *,
+    previous_status: str | None = None,
+    cache_hit: bool | None = None,
+    upstream_slot: str | None = None,
+    report: Mapping[str, Any] | None = None,
+    slot_conflict: bool = False,
+    unnormalized_status: bool = False,
+) -> dict[str, Any]:
+    """任务记录 → 一条**任务级**上报的属性集（2026-09-16 起这是诊断的唯一出口）。
+
+    为什么要有它：对调用方的响应体已收敛为**原生字段**（`adapter/seedance.py`），
+    原先"顺带"暴露在响应里的上游 task id、脚本摘要、请求/响应留档、实际生效值、
+    降级告警全部**没有别的地方可去**。它们不是可有可无的排障装饰 —— 缺了
+    `task.upstream_id` 就无法与上游对工单，缺了 `task.warnings` 就查不出
+    "我请求的 720p 到底有没有生效"。所以这里是**契约**，键名改名等于破坏排障面板。
+
+    设计取舍（三条，都是刻意的）：
+
+    1. **同一份数据既展开又整块给。** 标量叶子展开成 `task.effective.upstream_model`
+       这类键（可直接做过滤/告警），同时把 `task.requested` / `task.effective` /
+       `task.usage` / `task.artifacts` 整块给一份（一次看全，不用拼）。体积换可读性。
+    2. **数值不编。** 拿不到的字段**不出现**（而不是写 0 / null）：上报里
+       "没有这个键"与"这个键是 0"是两件事，混起来会让对账算错。
+    3. **凭证永不出现。** `credential_id` 是 HMAC 指纹（能回答"是不是同一把钥匙"而不可逆），
+       它**是**上报字段；凭证本身只在 `SpanHandle(secret=…)` 里用于打码。
+    """
+    out: dict[str, Any] = {}
+
+    def put(key: str, value: Any) -> None:
+        if value is None or value == "":
+            return                      # 见取舍 2：拿不到就不出现
+        out[key] = value
+
+    put("task.id", record.get("local_id"))
+    put("task.provider", record.get("provider"))
+    put("task.credential_id", record.get("credential_id"))
+    put("task.upstream_id", record.get("upstream_task_id"))
+    put("task.script.ref", record.get("script_ref"))
+    put("task.script.sha256", record.get("script_digest"))
+    put("task.model", record.get("model"))
+    put("task.model.bare", record.get("bare_model"))
+    # 实际发上游的那个名字。模型名已改为**透传**（写什么发什么），所以它通常等于
+    # `task.model.bare` —— 留着是为了让"透传被谁改过"这件事在 trace 上可证伪。
+    put("task.model.upstream", upstream_slot or record.get("bare_model"))
+
+    put("task.status", record.get("status"))
+    put("task.status.previous", previous_status)
+    if previous_status is not None:
+        out["task.status.changed"] = previous_status != record.get("status")
+    if unnormalized_status:
+        # 上游报了一个不在原生六态里的状态 ⇒ 已收敛到 running。**要有人看见**：
+        # 它意味着上游改了状态词表（或脚本漏了映射），而收敛会掩盖它。
+        out["task.status.unnormalized"] = True
+    if slot_conflict:
+        out["task.model.channel_conflict"] = True
+    history = record.get("status_history")
+    if history:
+        out["task.status.history"] = list(history)
+        out["task.status.changes"] = len(history)
+
+    put("task.created_at", record.get("created_at"))
+    put("task.updated_at", record.get("updated_at"))
+    put("task.expires_at", record.get("expires_at"))
+    put("task.execution_expires_at", record.get("execution_expires_at"))
+    put("task.callback_url", record.get("callback_url"))
+
+    report = report if isinstance(report, Mapping) else (record.get("upstream_report") or {})
+    put("task.query.count", report.get("query_count"))
+    put("task.query.last_at", report.get("last_query_at"))
+    if cache_hit is not None:
+        # 降频的观测量（`ADR-008`）：`True` = 这次查询**一次上游请求都没发**。
+        out["task.query.cache_hit"] = bool(cache_hit)
+
+    requested = record.get("requested")
+    if isinstance(requested, Mapping):
+        out["task.requested"] = dict(requested)
+        for key in ("model", "ratio", "resolution", "duration", "frames"):
+            put(f"task.requested.{key}", requested.get(key))
+    effective = record.get("effective")
+    if isinstance(effective, Mapping):
+        out["task.effective"] = dict(effective)
+        # `upstream_model` / `model_requested` 这一对是"我请求的 vs 实际跑的"。
+        # 响应体里已经没有 `model` 字段（上游模型名太乱，见 `seedance.py`）⇒
+        # **只有这里**能回答"我写 doubao-seedance-2-0-260128，实际跑的是哪个槽位"。
+        for key in (
+            "upstream_model",
+            "model_requested",
+            "model_map_applied",
+            # 命中的**通配模式**（含 `"*"`）。通配优先于"名字本身就是槽位名" ⇒ 它能把一个
+            # 合法槽位名改写成别的槽位；没有这一项，"为什么我请求 wan27、跑的是 t2v"
+            # 在 trace 里无解（响应体已收敛为原生字段，见 `ADR-011`）。
+            "model_map_pattern",
+            "ratio",
+            "resolution",
+            "duration",
+            "tier",
+        ):
+            put(f"task.effective.{key}", effective.get(key))
+        put("task.effective.estimated_credits", effective.get("estimated_credits"))
+        put("task.billing.billed", effective.get("billed"))
+        put("task.billing.note", effective.get("billing_note"))
+
+    warnings = record.get("warnings")
+    if warnings:
+        out["task.warnings"] = list(warnings)
+        out["task.warnings.count"] = len(warnings)
+    unsupported = record.get("unsupported")
+    if unsupported:
+        out["task.unsupported"] = list(unsupported)
+        out["task.unsupported.count"] = len(unsupported)
+
+    # `view` 是脚本规范化后的片段：用量与产物都住在它里面（记录顶层没有这两项）。
+    view = record.get("view") if isinstance(record.get("view"), Mapping) else {}
+    usage = view.get("usage")
+    if isinstance(usage, Mapping):
+        out["task.usage"] = dict(usage)
+        for key in ("completion_tokens", "total_tokens", "credits", "credits_charged", "credits_refunded"):
+            put(f"task.usage.{key}", usage.get(key))
+
+    view = view if isinstance(view, Mapping) else {}
+    artifacts = {
+        "video_url": view.get("video_url"),
+        "last_frame_url": view.get("last_frame_url"),
+        "file_url": view.get("file_url"),
+    }
+    put("task.artifacts", {k: v for k, v in artifacts.items() if v})
+    for key, value in artifacts.items():
+        put(f"task.artifacts.{key}", value)
+    put("task.artifacts.error", view.get("error"))
+    moved = record.get("rehost_result")
+    if moved:
+        out["task.rehost"] = dict(moved)
+        put("task.rehost.upstream_url", moved.get("upstream_url"))
+    if record.get("rehost"):
+        out["task.rehost.enabled"] = True
+    put("task.gate_key", record.get("gate_key"))
+    return out
 
 
 def upstream_response_attributes(

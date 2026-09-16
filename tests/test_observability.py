@@ -137,15 +137,25 @@ async def test_create_reports_upstream_task_id_and_both_sides_verbatim(client, a
         response = await client.post(TASKS, json=_body(content=[{"type": "text", "text": PROMPT}]), headers=headers)
         assert response.status_code == 200, response.text
         created = response.json()
-        assert created["upstream_task_id"] == "ck001"
+        # 原生契约：创建响应**只有 id**（上游 task id / 脚本身份 / 留档全部改由上报承载）
+        assert set(created) == {"id"}, sorted(created)
 
-    # span 名是契约：创建 / 翻译相位 / 上游调用三条都要在
-    assert {"task.create", "script.phase", "upstream.call"} <= {r.name for r in rec.records}
+    # span 名是契约：创建 / 翻译相位 / 上游调用 / 任务快照四条都要在
+    assert {"task.create", "script.phase", "upstream.call", "task.snapshot"} <= {
+        r.name for r in rec.records
+    }
 
     create = rec.one("task.create")
     assert create.attributes["task.id"] == created["id"]
-    assert create.attributes["task.upstream_id"] == "ck001", "上游 task id 必须进上报"
     assert create.attributes["request.id"] == "req-obs-1"
+    # 🔴 上游 task id 必须进上报。响应体里已经没有它了 ⇒ `task.snapshot` 是**唯一**出口，
+    # 这里断言不到它 = 与上游对工单的凭据整个丢了。
+    snap = rec.one("task.snapshot")
+    assert snap.attributes["task.upstream_id"] == "ck001", "上游 task id 必须进上报"
+    assert snap.attributes["task.script.ref"] == "aivideomaker/video@v1"
+    assert snap.attributes["task.script.sha256"]
+    assert snap.attributes["task.report.request"]["url"].endswith("/api/v1/generate/seedance20")
+    assert snap.attributes["task.report.response"]["body"]["taskId"] == "ck001"
 
     call = rec.one("upstream.call")
     assert call.attributes["upstream.phase"] == "create"
@@ -168,8 +178,20 @@ async def test_query_reports_upstream_task_id_and_raw_response(client, app, upst
         assert got.status_code == 200, got.text
 
     query = rec.one("task.query")
-    assert query.attributes["task.upstream_id"] == "ck001"
     assert query.attributes["task.id"] == created["id"]
+    assert query.attributes["task.status"] == "running"
+    # 上游 task id / 上游原文 / 这一跳的数据来源都在 task.snapshot 上（响应体已只剩原生字段）
+    snap = rec.one("task.snapshot")
+    assert snap.attributes["task.upstream_id"] == "ck001"
+    assert snap.attributes["task.upstream.raw"]["status"] == "PROGRESS"
+    assert snap.attributes["task.query.served"] == "upstream"
+    assert snap.attributes["task.query.cache_hit"] is False
+    assert snap.attributes["task.status.previous"] == "queued"
+    assert snap.attributes["task.status.changed"] is True
+    assert snap.attributes["task.status.history"] == [
+        {"status": "queued", "at": snap.attributes["task.created_at"]},
+        {"status": "running", "at": snap.attributes["task.updated_at"]},
+    ]
     call = rec.one("upstream.call")
     assert call.attributes["upstream.phase"] == "query"
     assert call.attributes["task.upstream_id"] == "ck001", "查询相位也要带上游 task id"
@@ -393,7 +415,8 @@ def test_exported_spans_keep_prose_verbatim_and_credential_masked():
             body = json.loads(attributes["upstream.request.body"])
             assert body["prompt"] == PROMPT, "提示词被脱敏器改写了 ⇒ 上报原文失效"
             assert json.loads(attributes["upstream.response.body"])["taskId"] == "ck001"
-            assert spans["task.create"].attributes["task.upstream_id"] == "ck001"
+            # 上游 task id 现在只在 task.snapshot 上（响应体里已删除该字段）
+            assert spans["task.snapshot"].attributes["task.upstream_id"] == "ck001"
 
             # 正文里**不许有脱敏痕迹**：这是"上报原文"的定义
             assert "Scrubbed" not in attributes["upstream.request.body"]
@@ -413,7 +436,7 @@ def test_exported_spans_keep_prose_verbatim_and_credential_masked():
             for entry in json.loads(attributes.get("logfire.scrubbed") or "[]"):
                 assert observability.is_credential_name(entry["path"][-1]), entry
             # sink 与导出层看到的是同一份内容（否则"离线校验"就是自娱自乐）
-            assert rec.one("task.create").attributes["task.upstream_id"] == "ck001"
+            assert rec.one("task.snapshot").attributes["task.upstream_id"] == "ck001"
         finally:
             upstream.stop()
             observability.clear_span_sinks()
@@ -475,6 +498,112 @@ def test_healthz_reports_a_refused_capture_headers_deployment():
     assert state.ready is False and state.emitting is False
     assert "refused" in state.reason, state.reason
     assert observability.flush_spans() is True
+
+
+# =============================================================================
+# 4. 装配分支：曾经静默降级的两个开关
+# =============================================================================
+
+def test_logfire_console_flag_does_not_break_the_assembly():
+    """🔴 回归钉住（报告 F9）：`LOGFIRE_CONSOLE=true` 曾让**整个可观测降级**。
+
+    `logfire.configure(console=…)` 只接受 `ConsoleOptions | None`，传 `bool` 会抛
+    `AttributeError: 'bool' object has no attribute 'span_style'` —— 而失败路径是
+    "只降级、不阻止启动"，所以进程照常 healthy、日志里只有一行 warning，
+    只有 `/healthz.logfire.ready` 能看见。**这条分支以前没有任何测试覆盖，
+    所以它能一直漏下去**（17 项上报测试全绿）。
+    """
+    observability.reset_state()
+    # `_settings()` 把 logfire_console 写死成 False（本文件永不外发），这里显式翻过来
+    settings = dataclasses.replace(_settings(FakeUpstream()), logfire_console=True)
+    state = observability.setup_observability(settings)
+    assert state.ready is True, f"LOGFIRE_CONSOLE=true 又让装配挂了：{state.reason}"
+    assert "span_style" not in state.reason
+    observability.reset_state()
+
+
+def test_loguru_bridge_forwards_records_and_reports_its_state():
+    """loguru→logfire 桥：**在场就接、不在场如实说**（loguru 不是本服务的依赖）。
+
+    用假 loguru 模块注入 `sys.modules` —— 真 loguru 不装，正是要验的那个分支。
+    """
+    import collections
+    import types
+
+    calls: list[dict] = []
+    fake_logfire = types.SimpleNamespace(log=lambda **kw: calls.append(kw))
+
+    class FakeLogger:
+        def __init__(self):
+            self.sinks: dict[int, tuple] = {}
+            self.removed: list[int] = []
+
+        def add(self, sink, **kwargs):
+            self.sinks[len(self.sinks) + 1] = (sink, kwargs)
+            return len(self.sinks)
+
+        def remove(self, sink_id):
+            self.removed.append(sink_id)
+            self.sinks.pop(sink_id, None)
+
+    fake = FakeLogger()
+    File = collections.namedtuple("File", "path name type")
+
+    class Lvl:
+        name = "SUCCESS"
+
+    class Exc:
+        type = "ValueError"
+        value = "boom"
+
+    record = types.SimpleNamespace(
+        record={
+            "name": "app.worker", "level": Lvl(), "line": 42, "function": "run",
+            "file": File("/srv/app/worker.py", "worker.py", "file"),
+            "message": "任务提交完成",
+            "extra": {"task_id": "cgt-1", "provider": "aivideomaker"},
+            "exception": Exc(),
+        }
+    )
+
+    observability.reset_state()
+    real_import = sys.modules.get("loguru")
+
+    # ① 不在场 ⇒ 如实说，且**不抛**
+    sys.modules.pop("loguru", None)
+    state = observability.setup_observability(_settings(FakeUpstream()))
+    assert state.loguru_bridge.startswith("off:"), state.loguru_bridge
+    assert state.as_health()["loguru_bridge"] == state.loguru_bridge
+
+    # ② 在场 ⇒ 接上，且记录真的被转出去
+    try:
+        sys.modules["loguru"] = types.SimpleNamespace(logger=fake)
+        observability._LOGURU_SINK_ID = None          # 模拟"首次挂载"
+        status = observability._attach_loguru_bridge(fake_logfire, level="INFO")
+        assert status == "on:INFO", status
+        sink, kwargs = fake.sinks[1]
+        assert kwargs["level"] == "INFO"
+        sink(record)
+        assert len(calls) == 1, calls
+        sent = calls[0]
+        assert sent["msg_template"] == "任务提交完成"
+        # `SUCCESS` 不是 OTel 级别名 ⇒ 必须折到 INFO（直接透传会被当成未知级别）
+        assert sent["level"] == "INFO"
+        assert sent["attributes"]["loguru.extra.task_id"] == "cgt-1"
+        assert sent["attributes"]["code.filepath"] == "/srv/app/worker.py"
+        assert sent["attributes"]["exception.type"] == "ValueError"
+        # 幂等：重复挂会**把同一行日志发多遍**，而 logfire 上看不出来
+        assert observability._attach_loguru_bridge(fake_logfire).endswith("(already attached)")
+        assert len(fake.sinks) == 1
+        # ③ `reset_state` 要真的摘掉 sink（否则下一个用例在"已挂载"的世界里跑）
+        observability.reset_state()
+        assert fake.removed == [1] and fake.sinks == {}
+    finally:
+        if real_import is not None:
+            sys.modules["loguru"] = real_import
+        else:
+            sys.modules.pop("loguru", None)
+        observability.reset_state()
 
 
 def _run_all() -> int:

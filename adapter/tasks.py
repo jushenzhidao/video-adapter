@@ -1,11 +1,15 @@
 """任务编排：id 生成、凭证指纹、状态机、惰性查询、回调推送、超时看门狗。
 
-三条不可协商的规则：
+四条不可协商的规则：
 
-1. **创建只返回 `{"id": …}`**，没有 status（Seedance 契约）—— 必须轮询或走回调。
-2. **任务与凭证绑定**（§6.3b）：任务记录里存创建时那把 Key 的**指纹**，
+1. **响应体只含原生字段**（`adapter/seedance.py` 是形状的唯一实现点）：
+   创建**只回 `{"id": …}`**、没有 status；查询不含 `model`、也不含任何诊断块。
+2. **诊断改道 logfire**：上游 task id / 脚本身份 / 请求响应留档 / 实际生效值 /
+   降级告警**全部**经 `_emit_snapshot()` 上报 —— 每个出口都要调它，
+   少调一处就是静默丢证据（响应体已经不是它们的地盘了）。
+3. **任务与凭证绑定**（§6.3b）：任务记录里存创建时那把 Key 的**指纹**，
    查询/取消时指纹不符 ⇒ **本地 404**，根本不发上游请求。
-3. **锁链要闭环**：并发槽位从创建占到终态；每个失败出口都必须释放它。
+4. **锁链要闭环**：并发槽位从创建占到终态；每个失败出口都必须释放它。
 """
 
 from __future__ import annotations
@@ -20,7 +24,7 @@ import string
 import time
 from typing import Any, Mapping
 
-from . import media, observability, scriptstore
+from . import media, observability, scriptstore, seedance
 from .channel import ChannelConfig, build_auth_headers
 from .ctx import Context, TaskView
 from .errors import AdapterError, task_not_found
@@ -35,14 +39,20 @@ from .executor import (
 from .normalize import normalize_payload
 from .queue import ConcurrencyGate
 from .ratelimit import QUERY
+from .seedance import TERMINAL_STATUSES
 from .settings import Settings
-from .taskstore import TERMINAL_STATUSES, TaskStore
+from .taskstore import TaskStore
 from .transport import UpstreamClient
 
 log = logging.getLogger("video_adapter.tasks")
 
 DEFAULT_EXECUTION_EXPIRES_AFTER = 172800  # 上游文档默认 48h
 _ID_ALPHABET = string.ascii_lowercase + string.digits
+
+#: 状态变更历史的保留条数（**有界**）。报告 F8 记的是"中间态被逐次覆盖 ⇒ 看不到状态
+#: 推进"；只在状态**真的变了**时追加一条，36 次轮询通常只有 2~3 条，所以这个上限
+#: 只在异常长的任务上才会被触到 —— 触到时丢的是**最旧**的那几条。
+STATUS_HISTORY_LIMIT = 20
 
 
 def new_task_id(now: _dt.datetime | None = None) -> str:
@@ -119,8 +129,9 @@ class TaskService:
         self._background: set[asyncio.Task] = set()
         #: 查询结果的短 TTL 缓存：`key → (monotonic 截止, 渲染结果)`。
         #: **这是降频的主力** —— 调用方的轮询间隔通常比上游的限额密，窗口内直接回放，
-        #: 一次上游请求都不发。`upstream_report.query_count` 统计的是**真实上游查询数**，
-        #: 缓存命中**不**计入 —— 那个数字正是我们要压下去的。
+        #: 一次上游请求都不发。记录里的 `upstream_report.query_count`（→ logfire 的
+        #: `task.query.count`）统计的是**真实上游查询数**，缓存命中**不**计入 ——
+        #: 那个数字正是我们要压下去的；`task.query.cache_hit` 才是"这次省了"的标记。
         self._query_cache: dict[tuple[str, str], tuple[float, dict]] = {}
         #: single-flight：同一任务的并发查询合并成一次上游调用。
         self._inflight: dict[tuple[str, str], asyncio.Task] = {}
@@ -254,10 +265,17 @@ class TaskService:
                 },
                 "query_count": 0,
             },
+            # 原生回显块：查询还没发生时靠它让第一次 `GET` 就能给出完整的原生字段集
+            # （而不是一排 `null` —— 那分不清"参数没生效"与"还没开始算"）。
+            "native": seedance.create_echo(payload, plan.get("effective")),
+            # 有界的状态变更历史（见 `STATUS_HISTORY_LIMIT`）。初始态 `queued` 就是第一条。
+            "status_history": [{"status": "queued", "at": now}],
             "view": None,
             "upstream": result.body,
         }
         await self.store.put(record)
+        # `include_report=True`：**创建是唯一带 request/response 原文的出口**（见 `_emit_snapshot`）。
+        self._emit_snapshot(record, include_report=True)
         log.info(
             "task created local_id=%s provider=%s model=%s upstream_task_id=%s",
             local_id,
@@ -265,7 +283,8 @@ class TaskService:
             bare_model,
             upstream_task_id,
         )
-        return {"id": local_id, **self._report(record)}
+        # 原生契约：**只有 id**（`seedance-api-reference.md` §3.3）。其余全部进 logfire。
+        return seedance.render_created(record)
 
     # ------------------------------------------------------------------ 查询
     async def get(self, channel: ChannelConfig, local_id: str, *, request_id: str = "") -> dict:
@@ -280,6 +299,8 @@ class TaskService:
         """
         record = await self._authorize(channel, local_id)
         if record["status"] in TERMINAL_STATUSES:
+            # 终态任务**本地直接作答**（本来就不查上游）；上报里标明这一跳的来源。
+            self._emit_snapshot(record, served="local-terminal")
             return self._render(record)
 
         # 键含 `credential_id`：local_id 本身全局唯一，把凭证一起放进来是零成本的一道保险
@@ -288,6 +309,9 @@ class TaskService:
 
         cached = self._cache_get(cache_key)
         if cached is not None:
+            # 降频命中：这一次**没有发上游请求**。`cache_hit` 是降频唯一可核的观测量
+            # （`ADR-008`），所以它必须进上报 —— 从响应体里看不出来。
+            self._emit_snapshot(record, served="cache", cache_hit=True)
             return cached
 
         task = self._inflight.get(cache_key)
@@ -377,7 +401,10 @@ class TaskService:
     async def _apply_fragment(self, record: dict, fragment: dict, *, raw: Any = None) -> dict:
         fragment = dict(fragment or {})
         previous = record.get("status")
-        status = str(fragment.get("status") or previous or "running")
+        # 状态**必须落在原生六态里**（`seedance.ARK_STATUSES`）：脚本给的值也可能越界
+        # （上游新增状态词 / 脚本漏了映射）。收敛放在引擎这一层 —— 不认识的中间态
+        # 绝不能被当成终态，终态会落库、释放并发槽位、推回调。
+        status, unnormalized = seedance.coerce_status(fragment.get("status") or previous)
         now = int(_dt.datetime.now(tz=_dt.timezone.utc).timestamp())
 
         # 超时看门狗：上游没有 expired 态，由本层兜底（§6.5）
@@ -431,12 +458,25 @@ class TaskService:
         if warnings != list(record.get("warnings") or []):
             updates["warnings"] = warnings
 
+        if status != previous:
+            history = list(record.get("status_history") or [])
+            history.append({"status": status, "at": now})
+            updates["status_history"] = history[-STATUS_HISTORY_LIMIT:]
+
         record = await self.store.update(record["local_id"], **updates) or record
 
         if status in TERMINAL_STATUSES and previous not in TERMINAL_STATUSES:
             await self.gate.release(record.get("gate_key", ""), record["local_id"])
             if status != "cancelled":
                 self._schedule_callback(record, fragment)
+        self._emit_snapshot(
+            record,
+            previous_status=previous,
+            served="upstream",
+            cache_hit=False,
+            unnormalized=unnormalized,
+            upstream_raw=raw,
+        )
         return self._render(record)
 
     # ------------------------------------------------------------------ 取消 / 删除
@@ -445,6 +485,9 @@ class TaskService:
         status = record.get("status")
 
         if status in TERMINAL_STATUSES:
+            # 原生终态 `DELETE` = **删记录**（不是取消）。删掉之后本地不再有它的上报，
+            # 所以这一条快照是它在 trace 上的最后一份证据。
+            self._emit_snapshot(record, served="delete", deleted=True)
             await self.store.delete(local_id)
             return {"id": local_id, "deleted": True}
 
@@ -492,8 +535,16 @@ class TaskService:
             raise
 
         now = int(_dt.datetime.now(tz=_dt.timezone.utc).timestamp())
-        record = await self.store.update(local_id, status="cancelled", updated_at=now) or record
+        history = list(record.get("status_history") or [])
+        history.append({"status": "cancelled", "at": now})
+        record = await self.store.update(
+            local_id,
+            status="cancelled",
+            updated_at=now,
+            status_history=history[-STATUS_HISTORY_LIMIT:],
+        ) or record
         await self.gate.release(record.get("gate_key", ""), local_id)
+        self._emit_snapshot(record, previous_status=status, served="cancel")
         return self._render(record)
 
     # ------------------------------------------------------------------ 列表
@@ -505,7 +556,7 @@ class TaskService:
             credential_id=credential_id, provider=channel.provider, page_num=page_num, page_size=page_size
         )
         return {
-            "items": [self._render(r) for r in rows],
+            "items": [seedance.render_task(r) for r in rows],
             "total": total,
             "page_num": page_num,
             "page_size": page_size,
@@ -529,70 +580,76 @@ class TaskService:
         return record
 
     @staticmethod
-    def _report(record: dict) -> dict:
-        """上报块：**上游 task id + 脚本身份 + 请求/响应留档**（不脱敏）。
+    def _render(record: dict) -> dict:
+        """任务记录 → **原生任务对象**。
 
-        创建与查询都带上它 —— 排障时最需要的就是"这次发了什么、上游回了什么、
-        对应上游哪个任务"。**上游 task id 是与上游对工单的唯一凭据**，必须能拿到。
+        刻意只做转发：形状一旦散落在引擎里，就会出现"某个出口忘了跟着改"。
+        创建、查询、列表、回调推送**共用这一个函数**正是为了堵住它。
+        原先在响应体里的 `provider` / `upstream_task_id` / `script_ref` / `upstream_report`
+        / `requested` / `effective` / `warnings[]` / `unsupported[]` / `model` 全部**移除**，
+        改由 `_emit_snapshot()` 上报（形状的唯一真源见 `adapter/seedance.py`）。
         """
-        out = {
-            "provider": record.get("provider"),
-            "upstream_task_id": record.get("upstream_task_id"),
-            "script_ref": record.get("script_ref"),
-            "script_sha256": record.get("script_digest"),
-            "upstream_report": dict(record.get("upstream_report") or {}),
-        }
-        moved = record.get("rehost_result")
-        if moved:
-            out["rehost"] = moved
-        return out
+        return seedance.render_task(record)
 
-    @classmethod
-    def _render(cls, record: dict) -> dict:
-        """任务记录 → Seedance 任务对象（附上报块）。"""
-        view = record.get("view")
-        if not isinstance(view, dict):
-            view = {
-                "status": record.get("status", "queued"),
-                "video_url": None,
-                "last_frame_url": None,
-                "file_url": None,
-                "error": None,
-                "usage": None,
-                "duration": None,
-                "frames": None,
-                "framespersecond": None,
-                "ratio": None,
-                "resolution": None,
-                "seed": -1,
-            }
-        out = dict(view)
-        out["id"] = record.get("local_id")
-        out["model"] = record.get("model")
-        out["status"] = record.get("status", view.get("status"))
-        out["created_at"] = record.get("created_at")
-        out["updated_at"] = record.get("updated_at")
+    def _emit_snapshot(
+        self,
+        record: dict,
+        *,
+        previous_status: str | None = None,
+        cache_hit: bool | None = None,
+        served: str = "",
+        unnormalized: bool = False,
+        upstream_raw: Any = None,
+        deleted: bool | None = None,
+        include_report: bool = False,
+    ) -> None:
+        """把这份任务记录的**全部诊断**上报（响应体已收敛为原生字段）。
 
-        video_url = view.get("video_url") if out["status"] == "succeeded" else None
-        rehost = record.get("rehost_result") or {}
-        if video_url and rehost.get("ok"):
-            # 转存成功 ⇒ 对外给**自有地址**；上游原地址仍在 rehost.upstream_url 里可查
-            video_url = rehost["url"]
-        out["content"] = {
-            "video_url": video_url,
-            "last_frame_url": view.get("last_frame_url"),
-            "file_url": view.get("file_url"),
-        }
-        if record.get("requested") is not None:
-            out["requested"] = record.get("requested")
-        if record.get("effective") is not None:
-            out["effective"] = record.get("effective")
-        if record.get("warnings"):
-            out["warnings"] = record.get("warnings")
-        if record.get("unsupported"):
-            out["unsupported"] = record.get("unsupported")
-        out.update(cls._report(record))
-        return out
+        每个出口都必须调它：字段表在 `observability.task_snapshot_attributes()`，
+        这里只负责把结论 + 原文送到 span 上。`served` 说明这一跳的结果从哪来
+        （`local-terminal` / `cache` / `upstream` / `cancel` / `delete`），
+        它是"降频到底有没有生效"的判据。
+
+        🔴 `include_report` 决定**创建侧的 request/response 原文**带不带（**只有创建带**）。
+        查询侧改带三个**便宜**的定位键（`task.report.request.method/url` +
+        `task.report.full_on_span=task.create`）：
+        一次任务的 36 次轮询各带一份创建原文 ≈ 每个任务多几十 KB，而信息量为零
+        （2026-09-16 实测：4 次操作即 679 字符/条的重复）。上游 URL 里若塞了 base64 素材，
+        重复代价还要乘 `OBS_BODY_MAX_CHARS`。
+        ⇒ 单条 `GET` 的 trace 仍能回答"创建时打的是哪个端点、上游是哪个 task"，
+        完整原文在**创建那条 span** 上。
+
+        上报**永远不能影响业务**：整段包在 try 里 —— sink 或 logfire 炸了，
+        请求照常返回（可观测性的失败不该变成可用性故障）。
+        """
+        try:
+            report = record.get("upstream_report")
+            report = report if isinstance(report, dict) else {}
+            attributes = observability.task_snapshot_attributes(
+                record,
+                previous_status=previous_status,
+                cache_hit=cache_hit,
+                unnormalized_status=unnormalized,
+            )
+            if served:
+                attributes["task.query.served"] = served
+            if deleted is not None:
+                attributes["task.deleted"] = bool(deleted)
+            request = report.get("request")
+            if isinstance(request, Mapping) and not include_report:
+                attributes["task.report.request.method"] = str(request.get("method") or "")
+                attributes["task.report.request.url"] = str(request.get("url") or "")
+                attributes["task.report.full_on_span"] = "task.create"
+            with observability.span("task.snapshot", **attributes) as handle:
+                if include_report:
+                    if report.get("request"):
+                        handle.set_body_attribute("task.report.request", report["request"])
+                    if report.get("response"):
+                        handle.set_body_attribute("task.report.response", report["response"])
+                if upstream_raw is not None:
+                    handle.set_body_attribute("task.upstream.raw", upstream_raw)
+        except Exception as exc:  # noqa: BLE001 - 上报不得影响业务
+            log.debug("task snapshot 上报失败：%s", exc)
 
     def _schedule_callback(self, record: dict, fragment: dict) -> None:
         url = record.get("callback_url")
@@ -651,10 +708,13 @@ class TaskService:
             previous = record.get("status")
             if previous in TERMINAL_STATUSES:
                 continue
+            history = list(record.get("status_history") or [])
+            history.append({"status": "expired", "at": now})
             updated = await self.store.update(
                 record["local_id"],
                 status="expired",
                 updated_at=now,
+                status_history=history[-STATUS_HISTORY_LIMIT:],
                 view={
                     "status": "expired",
                     "error": {"code": "Expired", "message": "task exceeded execution_expires_after"},
@@ -663,6 +723,9 @@ class TaskService:
             if updated:
                 await self.gate.release(updated.get("gate_key", ""), updated["local_id"])
                 self._schedule_callback(updated, {"status": "expired"})
+                # 看门狗没有调用方请求可借钥匙，但它是**唯一**能发现超时的地方 ⇒
+                # 必须上报，否则"任务卡住了"在 trace 上完全没有痕迹。
+                self._emit_snapshot(updated, previous_status=previous, served="reconciler")
                 touched += 1
         return touched
 
