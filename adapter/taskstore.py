@@ -37,11 +37,10 @@ import json
 import logging
 from abc import ABC, abstractmethod
 
+from .seedance import TERMINAL_STATUSES  # noqa: F401  —— 单一真源在 seedance.py（原生六态）
 from .settings import Settings
 
 log = logging.getLogger("video_adapter.taskstore")
-
-TERMINAL_STATUSES = frozenset({"succeeded", "failed", "expired", "cancelled"})
 
 
 class TaskStore(ABC):

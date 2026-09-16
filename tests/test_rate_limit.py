@@ -37,6 +37,7 @@ import httpx
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from adapter import observability  # noqa: E402
 from adapter.main import create_app  # noqa: E402
 from adapter.ratelimit import build_rate_limiter, origin_of  # noqa: E402
 from adapter.settings import Settings  # noqa: E402
@@ -53,6 +54,27 @@ OPTS = json.dumps({"provider": "aivideomaker", "max_credits": 5000, "allow_unpri
 TEST_REDIS_URL = os.environ.get("RATE_LIMIT_TEST_REDIS_URL", "redis://127.0.0.1:6379/15")
 #: 一个**故意连不上**的地址（连接被拒，用来验证降级路径）。
 DEAD_REDIS_URL = "redis://127.0.0.1:1/0"
+
+
+@contextlib.contextmanager
+def snapshots():
+    """收集 `task.snapshot` 上报（响应体已只剩原生字段，诊断证据在这里）。
+
+    降频的观测量有两个，都要看：`upstream.queries`（上游**真的**收到几次）
+    与上报里的 `task.query.cache_hit` / `task.query.count`（引擎**自认**省了几次）。
+    只信后者会漏掉"函数返回值对、但一次都没生效"这类实现。
+    """
+    seen: list[dict] = []
+
+    def sink(record):
+        if record.name == "task.snapshot":
+            seen.append(record.attributes)
+
+    observability.add_span_sink(sink)
+    try:
+        yield seen
+    finally:
+        observability.remove_span_sink(sink)
 
 
 class FakeUpstream:
@@ -280,12 +302,15 @@ async def test_cache_expiry_lets_a_fresh_query_through(client, app, upstream):
     assert upstream.queries == 1
 
     await asyncio.sleep(0.08)  # 越过 TTL
-    second = (await client.get(f"{TASKS}/{task_id}", headers=ch.headers)).json()
+    with snapshots() as snaps:
+        second = (await client.get(f"{TASKS}/{task_id}", headers=ch.headers)).json()
 
     assert upstream.queries == 2, upstream.queries
     assert second["status"] == "succeeded", "第 2 次上游查询返回 COMPLETED，应被如实反映"
-    # `query_count` 统计的是**真实上游查询数** —— 缓存命中不增加它，它才是"省了多少"的证据
-    assert second["upstream_report"]["query_count"] == 2
+    # `task.query.count` 统计的是**真实上游查询数** —— 缓存命中不增加它，
+    # 所以它才是"省了多少"的证据（响应体里已不含这个数字，改从上报取）。
+    assert snaps[-1]["task.query.count"] == 2
+    assert snaps[-1]["task.query.cache_hit"] is False
 
 
 @case(query_cache_seconds=0.0)

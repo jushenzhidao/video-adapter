@@ -1,8 +1,17 @@
 # ADR-009: 映射 / 参数回退 / 模型降级 —— 三层切开，方向由成本决定，降级只允许能力驱动
 
 ## Status
-Proposed (2026-09-14)。设计真源见 `docs/04_能力映射与降级.md`（本文只记**决定**与**理由**）。
-尚未实现：现有实现是 `script_store/aivideomaker/video@v1.py`（正则映射 + 就近吸附 + `warnings[]`）。
+Proposed (2026-09-14)，**2026-09-16 部分被取代**。设计真源见 `docs/04_能力映射与降级.md`。
+
+| 部分 | 2026-09-16 的状态 |
+| --- | --- |
+| **L1 路由映射（D6）** | ⚠️ **已被取代**：正则/通配/最长匹配那一套**整条删掉**，改为"模型名**透传** + 渠道 `model_map` **精确**匹配"，见 `ADR-012`。本文 D6 只保留"表外置、未命中 400、命中可查"三条，其余作废 |
+| **L2 参数回退（D1–D4）** | 仍为 Proposed，**未实现**（现状仍是"就近吸附、平局向下"，`docs/04` §2 已记缺口） |
+| **L3 模型降级（D5）** | 仍为 Proposed，**未实现** |
+| **降级告知出口（D7/D8）** | ⚠️ **已被取代**：响应体不再承载任何诊断（`ADR-011`）⇒ 出口是 **logfire + `dry-run`**；结构化 `degradations[]` **未实现**，且"要做也不放响应体" |
+
+⚠️ 读本文时请连带读 `ADR-011`（响应体只含原生字段）与 `ADR-012`（模型名透传），
+否则会得出"降级只在 warnings 里、而响应体有 warnings"的过时结论。
 
 ## Background
 调用方按目标契约写的是**具体 Seedance 模型 ID**（`doubao-seedance-2-0-260128` 等 7 个，
@@ -65,19 +74,30 @@ L1 路由映射 / L2 参数回退 / L3 模型降级是三个独立授权面。
 **未命中 ⇒ 400 + 可用名**，**歧义 ⇒ 400 + 候选**（歧义不猜：`2.0` 与 `2.0 fast` 代价差数倍）；
 命中哪条规则要进上报（`model.map.hit`）。映射表不得跨 provider（ADR-002）。
 
-### D7. 新增结构化上报块 `degradations[]`，`warnings[]` 保留给人类
-`kind` 为固定枚举（`param_fallback` / `param_clamped` / `param_ignored` / `model_downgrade` /
-`capability_dropped`）；带 `requested`/`effective`/`reason`/`credits_delta`（**拿不到就 null，不编数字**）；
-`model_downgrade` 额外带 **`vendor_changed`**（`t2v` 实测是 minimax_h3 ⇒ `true`）——
-这是调用方最需要知道、也最容易漏报的一位。
+### D7.（**2026-09-16 取代**）降级告知的出口是 logfire 与 `dry_run`，**不是响应体**
 
-⚠️ **`dry_run` 不额外携带该块**（2026-09-14 用户决定）：dry-run 仍只回
-`requested` / `effective` / `warnings[]` / `unsupported[]`。
-⇒ 代价：在花钱之前只能读字符串判断"会不会被改"；`degradations[]` 只出现在**已提交**的任务响应里。
+原决定"新增结构化上报块 `degradations[]`"**未实现，且位置已作废**：`ADR-011` 把响应体收敛为
+**原生字段** ⇒ 里面既不会有 `degradations[]`，也不会有 `warnings[]` / `effective` / `unsupported[]`。
 
-### D8. 已有决定不改
-尾帧在单图上游上**可丢**（playbook §3.1 的原决定保留），但必须**结构化**上报为
-`capability_dropped`，不能只混在 `warnings[]` 里 —— 它决定的是**结束画面**。
+但**降级的告知义务没有取消**，只是换了出口：
+
+| 出口 | 内容 |
+| --- | --- |
+| logfire `task.snapshot` | `task.warnings[]`（人类可读）+ `task.unsupported[]` + `task.effective.*`（`upstream_model` / `model_requested` / `model_map_applied` / `estimated_credits`）+ `task.usage.*` |
+| `X-Dry-Run: 1` | `requested` / `effective` / `warnings[]` / `unsupported[]`（**形态不变**，`ADR-010` D5） |
+| 描述产物的字段 | `duration` / `resolution` / `ratio` / `generate_audio` / `draft` / `seed` 按**实际生效值**回显 |
+
+结构化 `degradations[]`（`kind` 枚举 + `credits_delta` + `vendor_changed`）的设计**保留在
+`docs/04` §4 作为草案**，但"要做就放在 `effective` 块与 logfire 属性里"——那是机器可读差值的既有落点。
+
+⚠️ **已接受的代价**：响应体不再能一眼看出"我被降级了"。接入方必须主动用三个通道之一
+（生效值字段 / `dry-run` / logfire）。这是本次契约收敛的直接代价，记在 `ADR-011`。
+
+### D8. 已有决定不改（**上报形态按 D7 修正**）
+尾帧在单图上游上**可丢**（playbook §3.1 的原决定保留），但必须**如实上报** —— 它决定的是
+**结束画面**。⚠️ 原措辞要求"结构化上报为 `capability_dropped`"，**该结构化块未实现**；
+现状是 `warnings[]` 里一条人类可读的说明（"has no last-frame input; the last frame was dropped"）
+→ 进 logfire。若将来做结构化（待定项），这一条与 D7 一并落位。
 
 ## Consequences
 - **正面**：把"会不会涨价""是不是换了供应商"从**字符串警告**变成**可编程事实**，
@@ -86,8 +106,10 @@ L1 路由映射 / L2 参数回退 / L3 模型降级是三个独立授权面。
 - **正面**：映射表外置后，同一份脚本可服务多个上游；新增上游不再改脚本（改配置）。
 - **负面**：默认 `down` 会让部分调用方拿到比预期短的片子（`7s` → `5s`）。这是**刻意**的
   取舍 —— 账单惊喜比时长惊喜贵得多。需要产品侧确认（OPEN-DECISIONS）。
-- **负面**：`degradations[]` 是新增响应字段。对既有调用方是纯加法，但控制面若做严格 schema
-  校验需同步（OPEN-DECISIONS）。
+- **负面**：（2026-09-16 更新）响应体已收敛为原生字段（`ADR-011`）⇒ **降级告知不再出现在响应体**。
+  调用方若既不读 `dry-run`、也不看 logfire，就**无法感知**自己是否被降级 —— 这是既定取舍。
+- **负面**：`degradations[]` 未实现，且**不会**作为响应字段实现（原计划作废）。要结构化时落点是
+  `effective` 块 + logfire 属性。
 - **负面**：`model_map` / `fallback_chain` 挂在请求头上会让头变长，链一长可能吃紧；
   是否改为部署级配置待实测（OPEN-DECISIONS）。
 - **风险**：`vendor_changed` 依赖"映射表知道每个槽位背后是谁"。上游不保证槽位实现不变
