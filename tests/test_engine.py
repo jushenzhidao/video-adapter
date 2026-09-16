@@ -700,6 +700,76 @@ async def test_upstream_5xx_becomes_502(client, app, upstream):
 
 
 @case
+async def test_script_without_error_phase_keeps_the_generic_mapping(client, app, upstream):
+    """🔴 **错误相位是可选**：本脚本（aivideomaker）没声明 `<phase>_error` ⇒ 行为逐字不变。
+
+    这条是给"新增机制没有回流污染既有上游"上的锁（`ADR-015` 约束①）：
+    上游 400 仍然按 HTTP 状态落 `InvalidParameter`，不会被谁"顺手"改掉。
+    """
+    # 前提：本脚本确实没声明错误相位（否则这条测的就不是"回落"了）
+    from adapter import scriptstore  # noqa: PLC0415 - 只在这一条用例里需要
+
+    phases = scriptstore.phases(scriptstore.load(make_settings(upstream), "aivideomaker/video@v1"))
+    assert not [p for p in phases if p.endswith("_error")], phases
+    upstream.create_status = 400
+    upstream.create_error_body = {"status": "FAILED", "errorCode": "INVALID_PAYLOAD"}
+    ch = Client(upstream.base_url)
+    response = await client.post(TASKS, json=_body(), headers=ch.headers)
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == "InvalidParameter"
+
+
+@case
+async def test_broken_error_phase_cannot_mask_the_upstream_fault(client, app, upstream):
+    """🔴 错误相位自己崩了 ⇒ 只回落，**不许**把上游的 400 变成 500（`ADR-015` 约束③）。
+
+    用一个下毒的相位复现这条不变式：辅助逻辑的 bug 不得吞掉真实的上游故障 ——
+    否则一个"帮我们翻译错误码"的小功能，会把上游的明确拒绝变成我们的内部错误。
+    """
+    from adapter import scriptstore  # noqa: PLC0415
+
+    script = scriptstore.load(make_settings(upstream), "aivideomaker/video@v1")
+
+    def broken(ctx, payload):
+        raise RuntimeError("buggy auxiliary phase")
+
+    script.namespace["create_error"] = broken
+    try:
+        upstream.create_status = 400
+        upstream.create_error_body = {"message": "upstream said no"}
+        ch = Client(upstream.base_url)
+        response = await client.post(TASKS, json=_body(), headers=ch.headers)
+    finally:
+        script.namespace.pop("create_error", None)
+
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == "InvalidParameter"
+    assert "upstream said no" in response.json()["error"]["message"]
+
+
+@case
+async def test_error_phase_is_not_called_on_success(client, app, upstream):
+    """2xx 不走错误相位 —— 否则一个"顺手的错误处理"会平白多出一次脚本调用。"""
+    from adapter import scriptstore  # noqa: PLC0415
+
+    script = scriptstore.load(make_settings(upstream), "aivideomaker/video@v1")
+    calls: list = []
+
+    def spy(ctx, payload):
+        calls.append(payload)
+
+    script.namespace["create_error"] = spy
+    try:
+        ch = Client(upstream.base_url)
+        response = await client.post(TASKS, json=_body(), headers=ch.headers)
+    finally:
+        script.namespace.pop("create_error", None)
+
+    assert response.status_code == 200, response.text
+    assert calls == [], "2xx 不该调用错误相位"
+
+
+@case
 async def test_upstream_insufficient_credits_becomes_429(client, app, upstream):
     upstream.create_status = 200
     ch = Client(upstream.base_url)

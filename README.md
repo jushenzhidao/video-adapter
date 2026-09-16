@@ -24,7 +24,8 @@ Seedance 是一份**规范化的超集协议**：文生视频 / 图生视频（�
 | [`docs/03_引擎架构.md`](docs/03_引擎架构.md) | **服务怎么搭**：渠道契约（11 个头）、脚本契约（相位 + `ctx`）、任务持久化、模块划分、实施顺序 | 引擎架构（**取代 playbook §10 的分层清单**） |
 | [`docs/04_能力映射与降级.md`](docs/04_能力映射与降级.md) | **两者对不上怎么办**：Seedance 具体模型 ID → 上游 8 个粗槽位的声明式映射表、参数回退方向（`6s=>5s`）、能力驱动的模型降级链、结构化 `degradations[]` 上报契约 | 适配层**策略**真源（不改两侧契约，只规定差值怎么处理） |
 | [`docs/upstreams/aivideomaker-official-api.md`](docs/upstreams/aivideomaker-official-api.md) | **上游长什么样**：aivideomaker 官方线 8 个模型的字段表与类型、计费公式、状态、限流，以及**与旧实现的 6 处差异核对** | 上游契约（脚本逐条实现本文件） |
-| [`docs/decisions/`](docs/decisions/) | **为什么这么做**：`OPEN-DECISIONS.md`（悬而未决登记册，只追加 + 就地关闭）＋ `ADR-001…013`（已锁定的架构决策及其代价；对调用方影响最大的两条是 [`ADR-011`](docs/decisions/ADR-011-native-only-response.md) 响应体只含原生字段、[`ADR-012`](docs/decisions/ADR-012-model-name-passthrough.md) 模型名透传；边界类一条是 [`ADR-013`](docs/decisions/ADR-013-batching-boundary.md) **攒批不在本层做**、归 atask-service） | 决策台账（每次开工先复现未决项） |
+| [`docs/upstreams/senseaudio-official-api.md`](docs/upstreams/senseaudio-official-api.md) | **第二个上游长什么样**：SenseAudio 两个端点、`content[]` 的三种形状差异（`url` 平铺 / `type=image` / `role=reference`）、两模式互斥、`watermark` 默认值**相反**、无取消端点、无用量字段，以及**与目标契约的 15 处差异核对**＋**7 项未证实项** | 上游契约（`script_store/senseaudio/video@v1.py` 逐条实现本文件） |
+| [`docs/decisions/`](docs/decisions/) | **为什么这么做**：`OPEN-DECISIONS.md`（悬而未决登记册，只追加 + 就地关闭）＋ `ADR-001…016`（已锁定的架构决策及其代价；对调用方影响最大的两条是 [`ADR-011`](docs/decisions/ADR-011-native-only-response.md) 响应体只含原生字段、[`ADR-012`](docs/decisions/ADR-012-model-name-passthrough.md) 模型名透传；边界类四条是 [`ADR-013`](docs/decisions/ADR-013-batching-boundary.md) **攒批不在本层做**、归 atask-service、[`ADR-014`](docs/decisions/ADR-014-no-cancel-endpoint-delete-semantics.md) **上游无取消端点时 `DELETE` 响亮失败**、[`ADR-015`](docs/decisions/ADR-015-error-phase-mapping.md) **上游业务码经可选错误相位映射**、[`ADR-016`](docs/decisions/ADR-016-credential-bound-status-lookup.md) **查询无参数 ⇒ 必须验明记录归属**） | 决策台账（每次开工先复现未决项） |
 
 ## 前门契约速查
 
@@ -32,7 +33,7 @@ Seedance 是一份**规范化的超集协议**：文生视频 / 图生视频（�
 POST   /api/v3/contents/generations/tasks        → {"id": "cgt-YYYYMMDDHHMMSS-xxxxx"}   # **只有 id**
 GET    /api/v3/contents/generations/tasks/{id}   → 原生任务对象（**逐键等于原生字段集**，status 六态）
 GET    /api/v3/contents/generations/tasks        → {items:[...], total}
-DELETE /api/v3/contents/generations/tasks/{id}   → 取消（仅 queued 可取消）/ 删除
+DELETE /api/v3/contents/generations/tasks/{id}   → 取消（仅 queued 可取消；**上游无取消端点时 400**）/ 删除
 ```
 
 **路径逐字等于原生**（不加前缀、不加路径段）；**多上游靠 `model = provider/model` 区分** ——
@@ -97,7 +98,9 @@ X-Channel-Options: {"provider":"aivideomaker","max_credits":5000,
 1. **渠道配置来源与 image-adapter 完全一致**：11 个 HTTP 头驱动，服务端不持有渠道/模型/计费知识。
 2. **翻译脚本写死在项目**：只接受 `X-Script-Ref` 命名引用，内联脚本被拒绝 —— 降级报告要经 review、可追溯。
 3. **引擎移植 image-adapter**：脚本 + AST 沙箱 + 相位（create/query/cancel）+ `ctx` API + 任务持久化。
-4. **首批上游**：aivideomaker 官方 API 线（`key` 头 + `/api/v1/*`，8 个模型）。
+4. **首批上游**：aivideomaker 官方 API 线（`key` 头 + `/api/v1/*`，8 个模型）；
+   第二个上游 `senseaudio`（`Authorization: Bearer` + `/v1/video/*`，1 个模型，
+   **无取消端点、无用量字段**）—— 见 [`docs/03_引擎架构.md`](docs/03_引擎架构.md) §5.4。
 
 详见 [`docs/03_引擎架构.md`](docs/03_引擎架构.md) §1。
 
@@ -134,7 +137,27 @@ X-Channel-Options: {"provider":"aivideomaker","max_credits":5000,
 - [x] **可观测（span / Logfire）接线**：每次上游调用带 **request/response 原文 + 上游 task id**，
       凭证在源头打码；字段表见 [`docs/03_引擎架构.md`](docs/03_引擎架构.md) §12，
       决策见 [`ADR-006`](docs/decisions/ADR-006-report-fidelity.md)
-- [x] 八套测试共 **233 项**全绿，零消耗（见下；其中 6+2 项需要真 redis）
+- [x] 九套测试共 **304 项**全绿，零消耗（见下；其中 6+2 项需要真 redis）
+- [x] **第二个上游 `senseaudio`**（2026-09-17）：`script_store/senseaudio/video@v1.py`
+      ＋ 上游契约 `docs/upstreams/senseaudio-official-api.md`（含 15 处差异核对与 7 项未证实项）
+      ＋ **54 项零消耗测试**（`python tests/test_senseaudio_video_v1.py`，含引擎级"上游实际收到的 body"断言）。
+      关键取舍：`watermark`/`generate_audio` **显式发送**（上游默认值与原生相反/未文档化）、
+      `content[]` 三种形状差异逐项改写、**媒体顺序一字不动**（`@图像n` 编号靠它）、
+      两模式互斥与仅音频一律 400、`usage` 恒 `null`（上游没有任何用量字段）。
+      连带修掉一处引擎缺陷：**上游没有取消端点时 `DELETE` 会伪造 `cancelled`**
+      （上游继续跑并计费、并发槽位提前释放）⇒ 改为响亮失败（[`ADR-014`](docs/decisions/ADR-014-no-cancel-endpoint-delete-semantics.md)）
+- [x] **错误相位**（2026-09-17 用户裁决，[`ADR-015`](docs/decisions/ADR-015-error-phase-mapping.md)）：
+      非 2xx 的错误体原先到不了脚本 ⇒ "上游并发已满/余额不足/计费账户异常"全被读成
+      "你的请求写错了"。现在由**可选**的错误相位（`create_error` / `query_error`）把业务码
+      映射成契约里已有的 code（`400015` → 429 `ServerOverloaded` + `Retry-After`、
+      `400001` → 429 `QuotaExceeded`、`400900~902` → 403 `AccountOverdueError`）；
+      认不出的码**不拦**（回落通用映射），不改既有上游一个字
+- [x] **查询无参数 · 身份来自凭证**（2026-09-17 用户实测，[`ADR-016`](docs/decisions/ADR-016-credential-bound-status-lookup.md)）：
+      该上游的 status 接口**不接受参数** ⇒ 上游回答的是"这把钥匙当前的那个任务"。
+      于是最坏形态的静默错出现了：旧任务被新任务顶掉后，查旧任务会拿到**新任务的状态与产物**。
+      现在 `query_response` **先验明记录归属**（`task_id` 对不上 ⇒ 400 并说明），
+      并建议渠道配 `max_concurrency: 1`（闸门键正是 `provider:凭证指纹`）。
+      文档那个 `?id=` 形态留成 `status_binding=task_id`
 - [x] **部署参数按实测重调**（2026-09-16）：删掉对异步 worker 无效的 `worker_connections`、
       `timeout`/`graceful_timeout` 改为**由上游超时推导**（不再写死 300/120，避免"调大上游超时
       就变得可被 SIGKILL"），并把 11 条不变式写成断言（`tests/test_gunicorn_config.py`）
@@ -156,9 +179,12 @@ X-Channel-Options: {"provider":"aivideomaker","max_credits":5000,
 # 依赖（隔离环境，别污染系统 Python）
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
-# 八套测试：全部零消耗（零网络、零真实生成请求）
-python tests/test_aivideomaker_video_v1.py    # 79 项 翻译层（透传/精确与通配映射/别名/遗留键拒绝）
-python tests/test_engine.py                   # 32 项 引擎端到端（本地假上游）
+# 九套测试：全部零消耗（零网络、零真实生成请求）
+python tests/test_aivideomaker_video_v1.py    # 79 项 翻译层一（透传/精确与通配映射/别名/遗留键拒绝）
+python tests/test_senseaudio_video_v1.py      # 68 项 翻译层二 + 引擎级（body 逐键断言/两模式互斥/
+                                              #        media 顺序不变/watermark 默认值相反/错误相位映射/
+                                              #        记录归属校验/无取消端点的 DELETE）
+python tests/test_engine.py                   # 35 项 引擎端到端（本地假上游）
 python tests/test_seedance_contract.py        # 15 项 **原生响应契约**（形状/字段集/六态/上报不丢）
 python tests/test_rate_limit.py               # 18 项 限流与降频（12 项进程内 + 6 项需 redis）
 python tests/test_persistence_redis.py        #  2 项 重启后仍能 GET（跨实例可见）+ 连不上 redis 启动失败
@@ -168,7 +194,7 @@ python tests/test_gunicorn_config.py          # 11 项 **部署参数不变式**
 
 # 文档门禁：把 README「接入示例」那一节当断言跑（零成本、只打本地假上游）
 # 发版工作流也会跑它 —— 文档会腐烂，但没人会因为文档过期收到告警。
-python scripts/verify_docs_examples.py        # 27 项 示例的状态码与字段名
+python scripts/verify_docs_examples.py        # 35 项 示例的状态码与字段名
 
 # 上报通路（线上，**会真外发**一条合成 span，需 LOGFIRE_TOKEN）
 LOGFIRE_TOKEN="$(cat /tmp/.logfire_token)" python scripts/logfire_online_probe.py
@@ -265,6 +291,38 @@ CH=(-H "X-Adapter-Key: $ADAPTER_KEY" \
     -H 'Content-Type: application/json')
 BODY='{"model":"aivideomaker/seedance20","content":[{"type":"text","text":"一只猫在打哈欠"}],"duration":5,"resolution":"720p","ratio":"16:9"}'
 ```
+
+### 换一个上游：只改渠道头（以 `senseaudio` 为例）
+
+```
+X-Upstream-Url:    https://api.senseaudio.cn        # base 即可，脚本自己拼 /v1/video/*
+X-Script-Ref:      senseaudio/video@v1
+X-Auth-Emit:       （留空）                          # 上游是标准 Bearer，原样转发 Authorization
+X-Channel-Options: {"provider":"senseaudio","max_credits":5000,"allow_unpriced":true,
+                    "max_concurrency":1}             # ⚠️ 该上游按 API key 回答 ⇒ 一把钥匙一个在跑任务
+BODY 的 model:     "senseaudio/doubao-seedance-2-0-260128"   # 上游认的就是这个火山原生 ID
+```
+
+⚠️ 与 aivideomaker 的五处不同，接入前必须知道（细节见
+[`docs/upstreams/senseaudio-official-api.md`](docs/upstreams/senseaudio-official-api.md) §7）：
+
+1. **终端点的 `DELETE` 会 400** —— 该上游没有取消端点，跑起来的任务停不下来
+   （[`ADR-014`](docs/decisions/ADR-014-no-cancel-endpoint-delete-semantics.md)）；
+2. **`usage` 恒为 `null`** —— 上游不返回任何用量/积分字段，本层不编数字（`ADR-010`）；
+3. **`watermark` 默认相反**（上游默认加、原生默认不加）—— 脚本会**显式发** `false`，
+   所以你不写也不会拿到带水印的产物；
+4. 🔴 **查询接口不带参数，任务身份来自 API key** —— 官方文档写 `?id=…`，实测不接受参数。
+   于是"上游答的是哪个任务"必须**自己验明**：返回记录的 `task_id` 与本任务不一致时
+   **直接 400**，绝不把别的任务的状态/产物写过来（`ADR-016`）。
+   连带要求 **`max_concurrency: 1`**：同一把钥匙上出现第二个在跑任务后，旧任务就再也查不到了；
+5. **上游忙 / 账户欠费不再被读成"你写错了"** —— 该渠道配了错误相位：`400015`（并发已满）
+   → 429 `ServerOverloaded`、`400001` → 429 `QuotaExceeded`、`400900~902` → 403
+   `AccountOverdueError`（[`ADR-015`](docs/decisions/ADR-015-error-phase-mapping.md)）。
+   渠道还额外可用 `status_binding` / `generate_audio_field` / `query_id_param` /
+   `retry_after_seconds` 四个键（见 `docs/03_引擎架构.md` §4.2 末尾）。
+
+> 📌 本节（aivideomaker 那一段）的每条都由 `scripts/verify_docs_examples.py` 断言；
+> `senseaudio` 的等价断言在 `tests/test_senseaudio_video_v1.py` §B（**不在本文档门禁内**）。
 
 ### 0) 先 dry-run：跑完整翻译 + 计费校验，**不发上游请求、零消耗**
 
@@ -376,6 +434,8 @@ curl -sS -X DELETE "$BASE/api/v3/contents/generations/tasks/$ID" "${CH[@]}"
 ```
 
 `queued` → 取消（返回 `status: cancelled`）；已终态 → 删除本地记录（`{"id": …, "deleted": true}`）。
+⚠️ 若该渠道的上游**没有取消端点**（如 `senseaudio`），未终态任务的 `DELETE` 返回 400 并说明原因
+—— 本层不会假装取消（那会让上游继续跑、继续计费），见 `ADR-014`。已终态任务的删除不受影响。
 `running` 的任务**拒绝取消**（上游只允许取消未开始的）—— 这一点与原生契约一致。
 
 ### 错误码速查（`scripts/verify_docs_examples.py` 逐条断言）
@@ -391,6 +451,10 @@ curl -sS -X DELETE "$BASE/api/v3/contents/generations/tasks/$ID" "${CH[@]}"
 | 本地并发闸门满 | 429 | `ServerOverloaded` |
 | **上游不可达（连不上 / 超时 / 连接中断）** | 502 | `UpstreamUnavailable` |
 | 上游 5xx | 502 | `InternalServiceError` |
+| **上游业务码**（有错误相位的上游，如 `senseaudio`）：并发已满 | 429 | `ServerOverloaded`（带上游给的 `Retry-After`） |
+| 上游业务码：余额/使用限制 · 计费账户异常 | 429 · 403 | `QuotaExceeded` · `AccountOverdueError` |
+| 上游业务码**认不出**（含脚本没声明的上游） | 按 HTTP 状态 | 回落通用映射（如 400 → `InvalidParameter`） |
+| 查询拿到的记录**不属于本任务**（上游按 API key 回答） | 400 | `InvalidParameter`（`param=id`，消息说明是哪个任务顶掉了它） |
 | 未预期异常（兜底） | 500 | `InternalServiceError`（**信封不变形**，绝不给裸 500） |
 
 信封恒为 `{"error": {"code", "message", "type", "param"?}}`（§10.1）——调用方按 `code` 分支即可。

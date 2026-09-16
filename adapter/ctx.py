@@ -99,7 +99,13 @@ class _ScriptObservability:
 
 
 class Context:
-    """相位函数的第一个参数。属性可写（脚本会挂自己的 `plan`）。"""
+    """相位函数的第一个参数。属性可写（脚本会挂自己的 `plan`）。
+
+    `upstream_error` **只在 `<phase>_error` 相位里有值**（`ADR-015`）：
+    上游回了非 2xx 时，引擎把「HTTP 状态 + 上游 `Retry-After` + 响应头」放在这里，
+    让脚本能把厂商自己的业务码（如 `400015`）映射成契约里已有的 `error.code`。
+    其余相位恒为 `None` —— 别在别处读它。
+    """
 
     def __init__(
         self,
@@ -128,8 +134,17 @@ class Context:
         code: str = "InvalidParameter",
         param: str | None = None,
         status: int | None = None,
+        retry_after: float | None = None,
     ):
-        raise AdapterError(str(message), code=code, param=param, status=status)
+        """给出一个出口错误（抛 `AdapterError`）。
+
+        `retry_after`（秒）只在 429 上有意义：错误相位映射"上游忙"这类错误时应当
+        **把上游给的 `Retry-After` 带出去**（`ctx.upstream_error['retry_after']`），
+        否则调用方只能瞎猜退避多久 —— 而立即重试只会持续撞线。
+        """
+        raise AdapterError(
+            str(message), code=code, param=param, status=status, retry_after=retry_after
+        )
 
     # --- 小工具 ---
     @staticmethod

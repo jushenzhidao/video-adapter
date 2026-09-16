@@ -6,7 +6,10 @@
 >
 > 三类 slug：`waiting-on-external-condition` / `design-decision-to-evaluate` / `existing-design-boundary`
 
-**汇总：9 已决 · 11 未决**（2026-09-16：关闭 2 项（`degradations[]` 进响应体、`model_map` 落位）、新增 3 项（响应体只含原生字段 —— 当日即决 ⇒ `ADR-011`；结构化 `degradations[]` 形态；loguru 桥接的级别默认值）。
+**汇总：10 已决 · 12 未决**（2026-09-17 晚：用户裁决 4 项 —— ① 本层**不需要**取消端点（保持 `ADR-014` 的响亮失败）；
+② 错误码映射**做**（⇒ `ADR-015`，原"非 2xx 错误体到不了脚本"一项当日关闭）；
+③ 查询参数值用**创建时返回的 `task_id`**（参数名仍取文档的 `id`，渠道可换）；④ `generate_audio` 按**扁平**发送。
+2026-09-17 早：接入第二个上游 `senseaudio` 时新增 2 项（其中 1 项当日即决 ⇒ `ADR-015`），并立 `ADR-014`。
 2026-09-16 晚追加 1 项：**攒批的上游约束形态**（攒批本身的边界当日即决 ⇒ `ADR-013`，但"约束是固定窗口、滑动窗口还是结算 gap"仍待实证 —— 它决定攒批能否用于"超刷"）。
 前次：2026-09-14 新增 4 项（映射/回退/降级落位 3 项 + 响应体是否暴露预估成本），其中 1 项当日即决 ⇒ 计费归属见 `ADR-010`、映射降级见 `ADR-009`）
 
@@ -32,3 +35,5 @@
 | 2026-09-16 | `ADR-009` D7 的遗留 | **结构化 `degradations[]` 要不要做**（不进响应体已定） | 字符串 `warnings[]` 机器不可消费；运维无法按"是否换了供应商"筛选 | 倾向做，但形态改为 `effective` 块 + logfire 属性（`kind` 枚举 / `credits_delta` / `vendor_changed`） | 是否真有消费方（new-api / 运维面板） | 明确消费方与所需字段，或确认只靠 `warnings[]` 足够 | OPEN · `design-decision-to-evaluate` |
 | 2026-09-16 | 用户指令「loguru 桥接 logfire」 | **loguru→logfire 桥接的级别默认值** | 本服务用 stdlib `logging`（WARNING+），但 loguru 是**宿主应用**的门面，其 INFO 行没有别处可查 | 已实现：默认 **INFO+**（`LOGFIRE_LOGURU_LEVEL` 可调），loguru 不在场则静默跳过并在 `/healthz.logfire.loguru_bridge` 如实说明 | 宿主实际日志量（是否需要降噪） | 观察到量过大而调 `WARNING`，或确认 INFO 合适 | OPEN · `waiting-on-external-condition` |
 | 2026-09-16 | 用户：「攒批其实是可以超刷的，比如上游的计费 gap 有 30 分钟，你可以在 30 分钟攒一批打过去」＋「**只要提交成功就能拿到任务**」 | **结算 gap 的确切形态**（时长 / 周期归属 / 窗口类型）与**结算失败时上游的处置** | 提交侧闸门**已确认不存在**（`ADR-004`：上游无计费前闸门；用户补充"提交成功即拿到任务"）⇒ 套利类型确定为**结算延迟 gap 型**。风险形态已写进 `ADR-013` D3 推论：提交后**不可撤销**、需要**周期累计**额度口径（不是单请求口径）、真实天花板是**在途数** | 收益真实，但三项仍未证实：① gap 的时长与归属（上游结算 vs new-api 结算周期）；② 窗口是**固定**还是**滑动**；③ 结算不足时上游怎么处置（任务 FAILED？账户欠费？影响后续提交？） | 上游商务 / 协议口径，以及受控实测 | 拿到 ①②③ 的事实，再决定 atask 侧是否实现"deadline 对齐绝对时刻"，以及**周期累计额度**落在 atask 还是 new-api | OPEN · `waiting-on-external-condition` |
+| 2026-09-17 | 接入 `senseaudio` 时暴露（`docs/upstreams/senseaudio-official-api.md` §5.1） | **非 2xx 的上游错误体到不了脚本 ⇒ `ref_code` 语义丢失** | 该上游用 **HTTP 状态码 + `ref_code`** 表达错误（`400015` 并发已满、`400001` 余额不足、`400900`~`400902` 计费账户），而 `executor.raise_for_status` 在 `*_response` 相位**之前**就抛了 ⇒ 出口码只由 HTTP 状态决定：那 5 个码一律落 400 `InvalidParameter`，调用方会把"上游忙/账户欠费"读成"我的请求写错了"且不退避重试 | 两个候选：① 新增相位（如 `create_error` / `query_error`），把错误体交给脚本映射；② 渠道级声明表 `X-Channel-Options.error_map: {"400015": "ServerOverloaded"}`（不改相位契约，配置即事实，与 `model_map` 同一姿势） | 需要一个消费方说清"哪几个码值得单独分支"；以及上游错误体的**确切 JSON 形状**（现在连 `message` 都取不到，见上游契约 §9 未证实项 2） | 拿到错误体样例后定形态；`tests/test_senseaudio_video_v1.py::test_engine_upstream_400_maps_to_invalid_parameter` 钉着现状，改动即红 | **RESOLVED**（2026-09-17 用户指令：「新增错误相位 / 渠道级 error_map」⇒ 取 ①）。Resolution：见 `ADR-015` —— 新增**可选**错误相位 `create_error` / `query_error` / `cancel_error`（`ctx.upstream_error` 带 status/retry_after/headers），由脚本把业务码映射成契约里已有的 code；三条约束是"可选（缺席即老行为）/ 不拦就算（回落通用映射）/ 绝不用它掩盖上游错误"。**未选 ② 的理由**：按业务码映射必须先从错误体里把码读出来，而错误体形状是**厂商知识** —— 写进引擎或写成 JSON 路径声明表，都等于让服务端持有上游知识（架构 D1 禁），且第二个厂商就要加第二套语法。⚠️ 该行原提到的"上游错误体确切形状"仍未知，故脚本对认不出的形状**不拦**（退化为通用映射），登记为上游契约 §9 未证实项 2 |
+| 2026-09-17 | 同上一轮的实测 | **`senseaudio` 的 `usage` 恒为 `null` ⇒ new-api 拿不到用量** | 该上游的查询响应**没有任何计费/用量/积分字段**，本层不编数字（`ADR-010` D5 同源） | 现状即"如实的空"。若 new-api 侧必须有 `usage` 才能计价，只能改成**按次计价**（控制面配），本层不提供 token 当量 | new-api 渠道侧的计价口径（与表中 2026-09-13 那条"`usage` 折算倍率"同源） | 定下 new-api 该渠道的计价方式（按次即可闭环） | OPEN · `waiting-on-external-condition` |

@@ -11,24 +11,49 @@
 
 `rate_limit_lane` 由调用方（`tasks.py`）按语义给出：查询传 `QUERY`（上游按 IP 限的就是它），
 创建 / 取消不传（不计入配额，但它们的 429 仍会回灌冷却）。见 `ratelimit.py`。
+
+## 错误相位 `<phase>_error`（可选，`ADR-015`）
+
+上游回**非 2xx** 时，`raise_for_upstream_error()` 先给脚本**一次映射机会**：
+调用脚本声明的 `<phase>_error`（`create_error` / `query_error` / `cancel_error`），
+由它把厂商自己的业务码（如 `400015` = 并发已满）映射成契约里已有的 `error.code`
+（`ServerOverloaded` 429 + `Retry-After`），而不是让"上游忙/账户欠费"一律落成
+"你的请求写错了"（400 `InvalidParameter`）—— 后者会让调用方**不退避重试**。
+
+三条约束：
+1. **可选**：脚本不声明该相位时行为与从前逐字一致（通用映射兜底）；
+2. **不拦就算**：错误相位正常返回 ⇒ 回落到 `raise_for_status` 的通用映射。
+   所以"认不出的业务码"由脚本自己决定不拦，引擎不猜；
+3. **绝不用它掩盖上游错误**：错误相位自己崩了（非 `AdapterError`）只记日志 + 回落，
+   不能让一个辅助相位的 bug 把真实的上游故障变成 500。
 """
 
 from __future__ import annotations
 
 import inspect
+import logging
 import time
 from urllib.parse import urlsplit
 
 from . import observability
 from .ctx import Context
-from .errors import channel_error, from_upstream_http
+from .errors import AdapterError, channel_error, from_upstream_http
 from .observability import UpstreamTrace
 from .scriptstore import LoadedScript
 from .transport import UpstreamClient, UpstreamResult
 
+log = logging.getLogger("video_adapter.executor")
+
 CREATE_PHASES = ("create_request", "create_response")
 QUERY_PHASES = ("query_request", "query_response")
 CANCEL_PHASES = ("cancel_request", "cancel_response")
+
+#: 非 2xx 时给脚本的**可选**映射钩子（`ADR-015`）。键是语义相位名，值是相位函数名。
+ERROR_PHASES: dict[str, str] = {
+    "create": "create_error",
+    "query": "query_error",
+    "cancel": "cancel_error",
+}
 
 
 def _origin(url: str) -> tuple[str, str, int | None]:
@@ -141,6 +166,48 @@ def _derive_trace(
         upstream_task_id=(task.upstream_task_id if task else ""),
         credential=ctx.credential,
     )
+
+
+async def raise_for_upstream_error(
+    script: LoadedScript, phase: str, result: UpstreamResult, ctx: Context
+) -> None:
+    """非 2xx → 出口错误。**先给脚本一次映射机会，再回落到通用映射**（`ADR-015`）。
+
+    为什么必须由脚本映射：上游的业务码活在一个**厂商自有的错误信封**里
+    （`ref_code` 放在顶层还是 `error` 子对象里、字段叫 `code` 还是 `ref_code`），
+    那是**厂商知识**，塞进引擎就等于让服务端持有上游知识（架构 D1 禁）；
+    而且猜错的代价是双向的 —— 猜"能读出来"就会读错，猜"读不出"就永远落回 400。
+
+    三个必须守住的性质（对应模块 docstring 的三条约束）：
+    ① 脚本没声明该相位 ⇒ 行为与从前**逐字一致**；
+    ② 相位正常返回 ⇒ 回落通用映射（"不敢认的业务码"由脚本自己决定不拦）；
+    ③ 相位自己抛非 `AdapterError` ⇒ 只记日志 + 回落（辅助相位不许掩盖真实故障）。
+    """
+    if result.ok:
+        return
+    error_phase = ERROR_PHASES.get(phase)
+    if error_phase and callable(script.namespace.get(error_phase)):
+        # 只在错误相位里填：其余相位恒为 None（脚本不该在别处读它）。
+        ctx.upstream_error = {
+            "status": result.status,
+            "retry_after": result.retry_after,
+            "headers": dict(result.headers or {}),
+            "phase": phase,
+        }
+        try:
+            await call_phase(script, error_phase, ctx, result.body)
+        except AdapterError:
+            raise                      # 脚本给出了精确的错误 ⇒ 就用它
+        except Exception as exc:       # noqa: BLE001 - 兜底：辅助相位不许掩盖上游错误
+            log.warning(
+                "the %s phase of script %s raised %s; falling back to the generic mapping",
+                error_phase,
+                script.ref,
+                type(exc).__name__,
+            )
+        finally:
+            ctx.upstream_error = None
+    raise_for_status(result, phase=phase)
 
 
 def raise_for_status(result: UpstreamResult, *, phase: str) -> None:

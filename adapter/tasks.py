@@ -33,7 +33,7 @@ from .executor import (
     CREATE_PHASES,
     QUERY_PHASES,
     call_phase,
-    raise_for_status,
+    raise_for_upstream_error,
     request_upstream,
 )
 from .normalize import normalize_payload
@@ -214,7 +214,9 @@ class TaskService:
                 auth_headers=build_auth_headers(channel),
                 idempotent=False,
             )
-            raise_for_status(result, phase="create")
+            # 非 2xx：**先让脚本映射厂商业务码**（如"上游并发已满" → 429 + Retry-After），
+            # 脚本不声明 `<phase>_error` 或不敢认 ⇒ 回落通用映射（ADR-015）。
+            await raise_for_upstream_error(script, "create", result, ctx)
             created = await call_phase(script, "create_response", ctx, result.body)
             upstream_task_id = str((created or {}).get("task_id") or "")
             if not upstream_task_id:
@@ -359,7 +361,7 @@ class TaskService:
                 # 但它们的 429 仍会回灌冷却 —— 见 ratelimit.py 的 QUERY 注释）。
                 rate_limit_lane=QUERY,
             )
-            raise_for_status(result, phase="query")
+            await raise_for_upstream_error(script, "query", result, ctx)
             fragment = await call_phase(script, "query_response", ctx, result.body)
         except AdapterError as exc:
             # 上游 404 可能意味着"上游侧任务没了"；不能因此丢掉本地记录（契约要 7 天可用），
@@ -502,6 +504,23 @@ class TaskService:
             self.settings, channel.script_ref, expected_sha256=channel.script_sha256
         )
         declared = scriptstore.phases(script)
+        if "cancel_request" not in declared:
+            # 🔴 **上游没有取消端点时，必须响亮失败，不能假装取消了。**
+            # 这条曾经静默走到下面那段（把本地记录置成 `cancelled`、释放并发槽位并返回
+            # `status: cancelled`）——三个后果都是实质性的：
+            #   ① 调用方以为任务停了，上游其实**还在跑并继续计费**；
+            #   ② 并发槽位提前释放 ⇒ 闸门少算一个在途任务（真实天花板是在途数）；
+            #   ③ 本地记录与上游状态从此永久不一致，且没有任何出口能看出这件事。
+            # 未终态任务只能由**上游**取消，本层无法替它做 ⇒ 400 并说明原因（`ADR-014`）。
+            # 已终态任务的 `DELETE` = 删本地记录，在本函数更早处返回，不受此影响。
+            raise AdapterError(
+                "this channel's upstream exposes no cancel endpoint, so a running task cannot "
+                "be cancelled; it will keep running (and keep being billed) upstream. Poll it "
+                "until it reaches a terminal status, then DELETE to drop the local record. "
+                'See docs/decisions/ADR-014-no-cancel-endpoint-delete-semantics.md',
+                code="InvalidParameter",
+                param="id",
+            )
         ctx = Context(
             options=dict(channel.options),
             upstream_url=channel.upstream_url,
@@ -516,20 +535,19 @@ class TaskService:
             ),
         )
         try:
-            if "cancel_request" in declared:
-                result, _plan = await request_upstream(
-                    script,
-                    "cancel_request",
-                    ctx,
-                    {"id": local_id},
-                    client=self.client,
-                    channel_url=channel.upstream_url,
-                    auth_headers=build_auth_headers(channel),
-                    idempotent=False,
-                )
-                raise_for_status(result, phase="cancel")
-                if "cancel_response" in declared:
-                    await call_phase(script, "cancel_response", ctx, result.body)
+            result, _plan = await request_upstream(
+                script,
+                "cancel_request",
+                ctx,
+                {"id": local_id},
+                client=self.client,
+                channel_url=channel.upstream_url,
+                auth_headers=build_auth_headers(channel),
+                idempotent=False,
+            )
+            await raise_for_upstream_error(script, "cancel", result, ctx)
+            if "cancel_response" in declared:
+                await call_phase(script, "cancel_response", ctx, result.body)
         except Exception:
             # 取消失败**不能**释放槽位：上游任务可能还在跑，槽位必须占到它真的结束
             raise
